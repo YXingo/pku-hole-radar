@@ -1,0 +1,29 @@
+{
+  "pages": [
+    {
+      "posts": [
+        {
+          "id": "105",
+          "created_at": "2026-09-05T08:00:00Z",
+          "text": "合成 fixture：旧帖子 105",
+          "url": "https://fixture.test/post/105"
+        },
+        {
+          "id": "104",
+          "created_at": "2026-09-05T07:59:00Z",
+          "text": "合成 fixture：旧帖子 104",
+          "url": "https://fixture.test/post/104"
+        },
+        {
+          "id": "103",
+          "created_at": "2026-09-05T07:58:00Z",
+          "text": "合成 fixture：旧帖子 103",
+          "url": "https://fixture.test/post/103"
+        }
+      ],
+      "exhausted": true,
+      "total": 3
+    }
+  ]
+}
+

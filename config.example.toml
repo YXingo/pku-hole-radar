@@ -1,0 +1,42 @@
+[app]
+timezone = "Asia/Shanghai"
+state_dir = "var"
+secrets_file = ".env"
+
+[poll]
+# launchd 负责整点日历调度；0 表示不再叠加应用层冷却。
+interval_seconds = 0
+page_size = 30
+# 0 表示不设置页数上限；分页异常由 token/重复页检测终止。
+max_pages = 0
+max_posts = 0
+# 0 表示不设置本轮 HTTP 请求次数上限。
+max_requests = 0
+request_spacing_seconds = 2
+retry_wait_seconds = 5
+run_timeout_seconds = 180
+connect_timeout_seconds = 5
+read_timeout_seconds = 15
+
+[source]
+# T0 尚未完成账号实测，以下值必须由本地验证后填写；示例不预填猜测地址。
+endpoint = ""
+post_url_template = ""
+contract_confirmed = false
+timestamp_unit = "seconds"
+
+[filters]
+include_any = []
+exclude_any = []
+
+[notify]
+provider = "stdout"
+# 可选 wechat 或 app；stdout 时仅用于离线预览。
+channel = "wechat"
+content_mode = "snippet"
+max_items = 20
+snippet_chars = 120
+max_message_chars = 6000
+max_send_attempts_per_day = 60
+pending_ttl_hours = 24
+send_retry_spacing_seconds = 1800
