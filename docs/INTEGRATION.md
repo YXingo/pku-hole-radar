@@ -1,11 +1,13 @@
 # 外部集成核验记录
 
-最后核验：2026-09-06（Asia/Shanghai）
+最后核验：2026-09-08（Asia/Shanghai）
 
 本文只记录已经看到的证据，不把客户端代码中的推断写成平台保证。树洞部分已经通过
 Chrome 中的合法登录会话观察到真实列表请求和成功响应，并由 PKUHoleRadar 自己的 CLI
 使用同一会话完成了一页只读 probe。PushPlus 首次实名前测试曾被拒绝；实名认证后按用户
-授权重新执行的合成测试已取得服务端受理流水号，但仍没有微信实际接收证据。
+授权重新执行的合成测试已取得服务端受理流水号，用户随后确认在微信中收到通知，并提供了
+设备通知卡片和详情页截图。该证据区分为“实际收件”，不把 PushPlus 的 `accepted` 冒称为
+永久送达保证或个人好友聊天。
 
 ## 1. 树洞
 
@@ -22,8 +24,8 @@ Chrome 中的合法登录会话观察到真实列表请求和成功响应，并�
 
 本次只记录结构、参数和不含凭据的样本，不保存原始响应正文。浏览器首页的真实请求使用
 `limit=10`，因此已把本地 `config.toml` 的初始 `page_size` 调整为 10；适配器仍按首版
-“不主动读取评论”的要求发送 `comment_limit=0`，这与网页显示的 10 是一个待由 CLI
-probe 验证的参数差异，不能静默宣称二者等价。
+“不主动读取评论”的要求发送 `comment_limit=0`。CLI probe 已验证这一参数组合在当前会话
+下可用，但不把网页的 `comment_limit=10` 与适配器的 `0` 静默宣称为完全等价。
 
 已观察到：
 
@@ -54,8 +56,8 @@ probe 验证的参数差异，不能静默宣称二者等价。
 
 合法浏览器会话已经证明当前首页实际使用 `/chapi/api/v3/hole/list_comments`，因此本地配置已填写
 这个 endpoint；CLI 也已在本机使用同一合法会话运行 `probe-source`，验证本项目
-`comment_limit=0` 的 page 1 请求被接受并成功解析。该结果只覆盖一页和当前会话，
-不等于跨页稳定性或原帖链接已经确认。
+`comment_limit=0` 的 page 1 请求被接受并成功解析。用户又确认候选原帖链接可以打开；这些结果
+覆盖当前会话和样本，不等于平台长期稳定或跨页永不漂移。
 
 请求：
 
@@ -110,7 +112,9 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 | 删除/屏蔽 | `hidden`、`status` 等字段存在；具体值语义未确认 | 未确认 |
 | 原帖 URL | 当前前端源码登记移动端 `/pages/postDetail`，候选为 `https://treehole.pku.edu.cn/ch/web/pages/postDetail?pid={id}`；用户已确认该链接能打开原帖 | 公开代码 + 用户实测确认 |
 
-因此在真实账号验证完成前，不能启用基于 PID 水位的“完整增量采集”声明。fixture 采集器会先覆盖分页不完整、置顶、重复和重启去重；真实适配器必须在 probe 中验证顺序、时间戳单位、链接和边界后才允许正式运行。
+因此当前配置可以在已确认的账号上试运行，但不能发布“平台保证完整增量”的声明。fixture
+采集器覆盖分页不完整、置顶、重复和重启去重；真实适配器已经完成一页字段/时间戳 probe
+和链接人工确认，跨页页漂移、末页信号和长期稳定性仍需运行中持续观察。
 
 ### 1.6 异常识别
 
@@ -127,7 +131,7 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 核验日期：2026-09-05。依据 [PushPlus 消息接口文档](https://www.pushplus.plus/doc/guide/api.html) 和 [开放接口文档](https://www.pushplus.plus/doc/guide/openApi.html)。
 
 - 发送地址为 `https://www.pushplus.plus/send`（官方正文仍展示 http 形式，但 FAQ 说明支持 HTTPS；实现固定使用 HTTPS）。
-- 使用 `POST` JSON body，必填 `token`、`content`；首版固定 `channel=wechat`、`template=txt`，不填 `topic`、`to` 或其他接收人字段，目标是 token 对应的本人。
+- 使用 `POST` JSON body，必填 `token`、`content`；实现使用 `template=txt`，`channel` 可配置为 `wechat` 或 `app`，不填 `topic`、`to` 或其他接收人字段，目标是 token 对应的本人。
 - `channel=wechat` 并不等于个人微信好友聊天。PushPlus 普通微信渠道使用微信服务号模板消息，默认会显示为服务号通知卡片，点击后查看详情；用户本次提供的截图“设备通知 / 查看详情”与该形态一致。若要让内容直接出现在服务号会话中，需要用户先向“pushplus 推送加”服务号发送“激活消息”，由 PushPlus 在有限时间/条数内改用客服消息；项目无法通过 API 强制永久保持这种形态。
 - 同步返回顶层 `code=200` 只表示服务端收到并接受了请求处理，不表示微信已发送或用户已看到；`data` 是 `shortCode` 流水号。
 - 官方开放接口可用 `GET https://www.pushplus.plus/api/open/message/sendMessageResult?shortCode=<shortCode>` 查询，响应 `data.status`：0 未投递、1 发送中、2 已发送、3 发送失败，失败原因在 `errorMessage`。查询需要另外配置 AccessKey；AccessKey 需要 secretKey 和安全 IP，且有效期目前约 7200 秒，因此首版默认不自动开启查询，未配置查询凭据时只记录 `accepted`。
@@ -143,8 +147,8 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 
 - PushPlus token：已写入本机 `.env`，文件权限保持为 600；本文不记录 token 值。
 - 发送请求：实名前的一次合成 `notify-test` 返回 `failed`；实名认证后按用户授权再次执行，返回 `accepted` 并生成服务端受理流水号。
-- 微信实际接收：实名后的合成 `notify-test` 已由用户确认在手机微信收到；用户又提供截图确认最新真实帖子批次已在微信中收到 PushPlus“设备通知”卡片。该证据证明微信实际收件，不证明它是个人聊天消息；此前较早的真实帖子批次仍没有单独收件截图。`accepted` 只表示 PushPlus 服务端受理。
-- 用户随后在服务号发送了“激活消息”；再次执行合成 `notify-test` 后 PushPlus 返回 `accepted`。是否已切换为服务号会话内的客服消息，仍需用户查看这次测试的实际展示形态确认。
+- 微信实际接收：用户确认在手机微信收到实名后的合成测试和真实帖子批次，并提供两张截图：一张是“设备通知”卡片，另一张是点击后的消息详情页。该证据证明实际收件和详情渲染，不证明它是个人好友聊天消息。
+- 用户随后在服务号发送了“激活消息”；后续请求仍返回 `accepted`。当前截图仍是设备通知/详情形态，没有足够证据证明已切换成服务号会话内的客服消息；PushPlus 的客服消息还受时间和条数限制。
 
 ## 3. 最小实测步骤（不在对话中提交凭据）
 
@@ -152,11 +156,11 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 2. 使用 `pku-hole-radar --config /绝对路径/config.toml doctor` 检查“存在性”和权限；输出不包含值。
 3. 使用 `probe-source` 只请求最新一页，不推进水位；保留数量、字段集合、PID 顺序、时间戳单位和 HTTP/业务结果，不保存正文或原始响应。
 4. 只有 probe 成功并人工确认结果后，才允许执行 `preview --live`；首轮正式运行仍只建立基线。
-5. 微信联调必须使用已完成实名认证且绑定接收微信的 PushPlus 账号。实名认证后已按用户授权执行合成 `notify-test`，结果为 `accepted`；实际打开微信确认后，才能记录“微信渠道验证通过”。测试正文必须是合成文本。
+5. 微信联调必须使用已完成实名认证且绑定接收微信的 PushPlus 账号。当前这台本机的合成 `notify-test` 已返回 `accepted`，且用户已实际打开微信确认收件，因此记录为“微信实际收件验证通过”；这不代表其他账号或未来批次自动通过。测试正文必须是合成文本。
 
 ## 4. 未确认项
 
 - 合法树洞账号下 `/hole/list` 与 `/hole/list_comments` 的完整差异；本次浏览器首页和 CLI probe 均使用 `/hole/list_comments`，但另一接口未比较。
 - `Authorization`、`pku_token`、`uuid`、XSRF 的最小组合及会话失效时具体 HTTP/业务响应；当前四字段组合已验证可用，但尚未做最小化实验。
 - `timestamp` 的长期单位/时区保证、PID 是否跨页严格按新帖降序、页漂移下的末页信号和删除/屏蔽字段语义；当前样本证明 Unix 秒形态，用户已确认候选原帖链接可打开。
-- 用户 PushPlus 账号完成实名认证后的实际额度、消息服务号绑定状态和微信接收结果。
+- PushPlus 账号的长期剩余额度、消息服务号绑定状态，以及后续每一批消息的实际收件；当前已有用户确认和截图，但 `accepted` 仍不是平台投递回执。

@@ -205,26 +205,24 @@ def _probe_source(config, secrets: dict[str, str]) -> int:
                     commit=False,
                     send=False,
                 )
-                summary = runner.run_once()
-                fetch = runner.last_fetch
-                if fetch is not None:
-                    print(
-                        f"来源探测：解析 {len(fetch.posts)} 个帖子，页数 {fetch.pages}，"
-                        f"请求 {fetch.request_count}，覆盖 {fetch.coverage.value}"
-                    )
-                    ids = [int(post.id) for post in fetch.posts]
-                    ordered = all(left >= right for left, right in zip(ids, ids[1:], strict=False))
-                    pinned = sum(post.is_pinned for post in fetch.posts)
-                    print(
-                        f"PID（响应映射后）前 {min(10, len(ids))} 个：{ids[:10]}；"
-                        f"当前样本非升序检查：{'通过' if ordered else '不通过'}；置顶数：{pinned}"
-                    )
+                page, request_count = runner.fetch_latest_page()
+                ids = [int(post.id) for post in page.posts]
+                ordered = all(left >= right for left, right in zip(ids, ids[1:], strict=False))
+                pinned = sum(post.is_pinned for post in page.posts)
+                print(
+                    f"来源探测：解析 {len(page.posts)} 个帖子，页数 1，"
+                    f"请求 {request_count}；本命令只读取最新一页"
+                )
+                print(
+                    f"PID（响应映射后）前 {min(10, len(ids))} 个：{ids[:10]}；"
+                    f"当前样本非升序检查：{'通过' if ordered else '不通过'}；置顶数：{pinned}；"
+                    f"显式结束标记：{'是' if page.exhausted else '否'}"
+                )
                 print(
                     "当前映射字段：pid、text、timestamp(seconds)、is_top、media_ids；"
                     "未写入基线或 outbox。"
                 )
-                _print_summary(summary)
-                return _summary_exit_code(summary, store)
+                return 0
             finally:
                 source.close()
 

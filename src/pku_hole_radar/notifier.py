@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -50,6 +51,10 @@ class PushPlusNotifier:
         self._channel = channel
         self._timeout_seconds = timeout_seconds
         self._owns_client = client is None
+        transport = getattr(client, "_transport", None) if client is not None else None
+        self._async_transport = (
+            transport if isinstance(transport, httpx.AsyncBaseTransport) else None
+        )
         self.client = client or httpx.Client(
             timeout=httpx.Timeout(timeout_seconds),
             follow_redirects=False,
@@ -93,11 +98,28 @@ class PushPlusNotifier:
                 response = self.client.post(self.ENDPOINT, json=payload)
             else:
                 effective_timeout = min(timeout_seconds, self._timeout_seconds)
-                response = self.client.post(
-                    self.ENDPOINT,
-                    json=payload,
-                    timeout=httpx.Timeout(effective_timeout),
-                )
+                timeout = httpx.Timeout(effective_timeout)
+                if self._owns_client or self._async_transport is not None:
+                    response = asyncio.run(
+                        self._async_post(
+                            payload=payload,
+                            timeout=timeout,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
+                else:
+                    # 仅保留给注入的同步测试 transport；生产客户端走可取消路径。
+                    response = self.client.post(
+                        self.ENDPOINT,
+                        json=payload,
+                        timeout=timeout,
+                    )
+        except TimeoutError:
+            return SendResult(
+                state=SendState.UNKNOWN,
+                error_kind=ErrorKind.UNKNOWN,
+                error_message="PushPlus 请求达到单轮运行时间上限，结果未知，已暂停自动重发",
+            )
         except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError):
             return SendResult(
                 state=SendState.PENDING,
@@ -188,6 +210,26 @@ class PushPlusNotifier:
                 error_message="PushPlus 成功响应缺少受理流水号，结果未知",
             )
         return SendResult(state=SendState.ACCEPTED, provider_receipt=receipt)
+
+    async def _async_post(
+        self,
+        *,
+        payload: dict[str, str],
+        timeout: httpx.Timeout,
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        client_kwargs: dict[str, object] = {
+            "timeout": timeout,
+            "follow_redirects": False,
+            "trust_env": False,
+        }
+        if self._async_transport is not None:
+            client_kwargs["transport"] = self._async_transport
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            return await asyncio.wait_for(
+                client.post(self.ENDPOINT, json=payload),
+                timeout=timeout_seconds,
+            )
 
 
 def _receipt(value: object) -> str | None:

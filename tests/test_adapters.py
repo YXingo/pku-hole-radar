@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from time import monotonic
 
 import httpx
 import pytest
@@ -24,8 +26,7 @@ def digest() -> Digest:
     )
 
 
-def live_source(handler) -> LiveTreeholeSource:
-    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+def live_source_with_client(client: httpx.Client) -> LiveTreeholeSource:
     return LiveTreeholeSource(
         "https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments",
         "https://treehole.pku.edu.cn/ch/web/pages/postDetail?pid={id}",
@@ -33,6 +34,11 @@ def live_source(handler) -> LiveTreeholeSource:
         uuid="local-uuid",
         client=client,
     )
+
+
+def live_source(handler) -> LiveTreeholeSource:
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    return live_source_with_client(client)
 
 
 def test_live_adapter_maps_verified_shape_and_does_not_put_auth_in_url() -> None:
@@ -108,6 +114,32 @@ def test_live_adapter_retries_are_runner_responsibility_and_transport_error_is_t
     assert error.value.kind == ErrorKind.TEMPORARY
 
 
+def test_live_adapter_timeout_cancels_slow_async_transport() -> None:
+    cancelled: list[bool] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(200, json={"code": 20000, "data": {"list": [], "total": 0}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    source = live_source_with_client(client)
+    started = monotonic()
+    try:
+        with pytest.raises(SourceError) as error:
+            source.fetch_page_with_timeout(None, 20, timeout_seconds=0.05)
+    finally:
+        source.close()
+        client.close()
+
+    assert monotonic() - started < 0.35
+    assert error.value.kind == ErrorKind.TEMPORARY
+    assert cancelled == [True]
+
+
 def test_pushplus_success_records_acceptance_receipt_and_fixed_payload() -> None:
     requests: list[httpx.Request] = []
 
@@ -175,3 +207,29 @@ def test_pushplus_does_not_turn_failure_or_unknown_into_acceptance(response, sta
     assert result.state == state
     assert result.error_kind == kind
     assert "push-secret" not in (result.error_message or "")
+
+
+def test_pushplus_timeout_cancels_slow_async_transport_and_marks_result_unknown() -> None:
+    cancelled: list[bool] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(200, json={"code": 200, "data": "short-code"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    notifier = PushPlusNotifier("push-secret", client=client)
+    started = monotonic()
+    try:
+        result = notifier.send_with_timeout(digest(), timeout_seconds=0.05)
+    finally:
+        notifier.close()
+        client.close()
+
+    assert monotonic() - started < 0.35
+    assert result.state == SendState.UNKNOWN
+    assert result.error_kind == ErrorKind.UNKNOWN
+    assert cancelled == [True]

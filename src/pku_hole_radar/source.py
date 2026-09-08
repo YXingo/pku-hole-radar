@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import UTC, datetime
@@ -152,6 +153,10 @@ class LiveTreeholeSource:
         self._connect_timeout_seconds = connect_timeout_seconds
         self._read_timeout_seconds = read_timeout_seconds
         self._owns_client = client is None
+        transport = getattr(client, "_transport", None) if client is not None else None
+        self._async_transport = (
+            transport if isinstance(transport, httpx.AsyncBaseTransport) else None
+        )
         timeout = httpx.Timeout(
             timeout=read_timeout_seconds,
             connect=connect_timeout_seconds,
@@ -224,18 +229,30 @@ class LiveTreeholeSource:
                 response = self.client.get(self.endpoint, params=params, headers=self._headers)
             else:
                 effective_timeout = min(timeout_seconds, self._read_timeout_seconds)
-                response = self.client.get(
-                    self.endpoint,
-                    params=params,
-                    headers=self._headers,
-                    timeout=httpx.Timeout(
-                        effective_timeout,
-                        connect=min(timeout_seconds, self._connect_timeout_seconds),
-                        read=effective_timeout,
-                        write=effective_timeout,
-                        pool=min(timeout_seconds, self._connect_timeout_seconds),
-                    ),
+                timeout = httpx.Timeout(
+                    effective_timeout,
+                    connect=min(timeout_seconds, self._connect_timeout_seconds),
+                    read=effective_timeout,
+                    write=effective_timeout,
+                    pool=min(timeout_seconds, self._connect_timeout_seconds),
                 )
+                if self._owns_client or self._async_transport is not None:
+                    response = asyncio.run(
+                        self._async_get(
+                            params=params,
+                            timeout=timeout,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
+                else:
+                    # 仅保留给注入的同步测试 transport；生产客户端走上面的可取消
+                    # AsyncClient 路径，避免同步读取阻塞整轮预算。
+                    response = self.client.get(
+                        self.endpoint,
+                        params=params,
+                        headers=self._headers,
+                        timeout=timeout,
+                    )
         except httpx.ConnectTimeout as exc:
             raise SourceError(
                 ErrorKind.TEMPORARY_NOT_SENT, "树洞连接超时，未确认请求已发出"
@@ -248,6 +265,11 @@ class LiveTreeholeSource:
             raise SourceError(ErrorKind.TEMPORARY, "树洞请求写入中断") from exc
         except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
             raise SourceError(ErrorKind.TEMPORARY, "树洞响应传输中断") from exc
+        except TimeoutError as exc:
+            raise SourceError(
+                ErrorKind.TEMPORARY,
+                "树洞请求达到单轮运行时间上限，结果未知",
+            ) from exc
         except httpx.HTTPError as exc:
             raise SourceError(ErrorKind.TEMPORARY, "树洞网络请求失败") from exc
 
@@ -307,6 +329,27 @@ class LiveTreeholeSource:
             exhausted=exhausted,
             total=total,
         )
+
+    async def _async_get(
+        self,
+        *,
+        params: dict[str, str],
+        timeout: httpx.Timeout,
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        client_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "follow_redirects": False,
+            "trust_env": False,
+            "cookies": self.client.cookies,
+        }
+        if self._async_transport is not None:
+            client_kwargs["transport"] = self._async_transport
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            return await asyncio.wait_for(
+                client.get(self.endpoint, params=params, headers=self._headers),
+                timeout=timeout_seconds,
+            )
 
 
 def _post_from_fixture(raw: Any) -> Post:

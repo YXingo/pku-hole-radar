@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pku_hole_radar.cli as cli_module
 from pku_hole_radar.cli import main
 from pku_hole_radar.config import load_config
-from pku_hole_radar.models import Coverage, Digest, Post
+from pku_hole_radar.models import Coverage, Digest, Page, Post
+from pku_hole_radar.source import SequenceSource
 from pku_hole_radar.store import Store
 
 
@@ -38,6 +41,58 @@ def test_live_command_missing_configuration_returns_config_error_without_network
     assert exit_code == 2
     assert "缺少配置" in error
     assert "secret-value" not in error
+
+
+def test_probe_source_reads_one_page_without_following_baseline_or_building_digest(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        Path("config.example.toml")
+        .read_text(encoding="utf-8")
+        .replace('state_dir = "var"', 'state_dir = "state"')
+        .replace('secrets_file = ".env"', 'secrets_file = "secrets.env"')
+        .replace(
+            'endpoint = ""',
+            'endpoint = "https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments"',
+        ),
+        encoding="utf-8",
+    )
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("PKUHOLE_TOKEN=local-token\n", encoding="utf-8")
+    os.chmod(secrets, 0o600)
+    loaded = load_config(config)
+    post = Post(
+        id="105",
+        created_at=datetime(2026, 9, 5, tzinfo=UTC),
+        text="probe sample",
+        url="https://treehole.pku.edu.cn/",
+    )
+
+    class CloseableSequenceSource(SequenceSource):
+        def close(self) -> None:
+            pass
+
+    source = CloseableSequenceSource([Page([post], next_page="2", total=100)])
+    monkeypatch.setattr(cli_module, "_make_live_source", lambda _config, _secrets: source)
+    with Store(loaded.app.database_path) as store:
+        store.set_states(
+            {
+                "baseline_initialized": "1",
+                "baseline_id": "100",
+                "watermark_id": "100",
+            }
+        )
+
+    assert main(["--config", str(config), "probe-source"]) == 0
+    output = capsys.readouterr().out
+    assert "页数 1" in output
+    assert "只读取最新一页" in output
+    assert "简报" not in output
+    assert source.calls == [(None, 30)]
+    with Store(loaded.app.database_path) as store:
+        assert store.baseline() == (True, "100")
+        assert store.outbox_counts() == {}
 
 
 def test_resume_source_can_explicitly_clear_cooldown(tmp_path: Path, capsys) -> None:

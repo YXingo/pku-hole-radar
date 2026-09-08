@@ -37,6 +37,6 @@ content_mode = "snippet"
 max_items = 20
 snippet_chars = 120
 max_message_chars = 6000
-max_send_attempts_per_day = 60
+max_send_attempts_per_day = 200
 pending_ttl_hours = 24
 send_retry_spacing_seconds = 1800

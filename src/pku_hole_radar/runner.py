@@ -293,7 +293,7 @@ class Runner:
         return result
 
     def fetch_latest_page(self) -> tuple[Page, int]:
-        """按同一轮 HTTP 预算和重试规则只获取最新页，供显式基线重设使用。"""
+        """按同一轮 HTTP 预算和重试规则只获取最新页，供基线重设和只读探测使用。"""
 
         started = self.clock.monotonic()
         budget = _Budget(
