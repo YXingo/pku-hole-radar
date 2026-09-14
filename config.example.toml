@@ -29,6 +29,20 @@ timestamp_unit = "seconds"
 include_any = []
 exclude_any = []
 
+# 关注摘要默认关闭；开启后只改变通知标题、详情排序和本地摘录，不改变采集范围。
+[attention]
+enabled = false
+title_max_chars = 40
+max_title_categories = 2
+# 公开示例不预设个人地点偏好；可填 "深圳"、"远程"，顺序即优先级。
+preferred_locations = []
+
+[attention.keywords]
+# 未列出的分组沿用代码内的通用预设；显式 [] 表示关闭该分组。
+llm4se = ["LLM4SE", "AI4SE", "代码智能", "coding agent", "SWE-bench"]
+llm = ["大模型", "大语言模型", "大型语言模型", "LLM", "LLMs"]
+agent = ["智能体", "AI Agent", "多智能体", "coding agent", "Agent"]
+
 [notify]
 provider = "stdout"
 # 可选 wechat 或 app；stdout 时仅用于离线预览。
@@ -39,4 +53,6 @@ snippet_chars = 120
 max_message_chars = 6000
 max_send_attempts_per_day = 200
 pending_ttl_hours = 24
+# 同一轮清理积压时，两次 PushPlus 请求至少间隔 13 秒，低于每分钟 5 次的限制。
+send_spacing_seconds = 13
 send_retry_spacing_seconds = 1800

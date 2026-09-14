@@ -222,6 +222,44 @@ def test_baseline_then_restart_dedupe_and_single_batch(tmp_path: Path) -> None:
         assert restarted.outbox_counts() == {"accepted": 1}
 
 
+def test_current_batch_is_sent_first_and_same_run_drains_due_backlog() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store)
+        seed_pending_batch(store, 101, "batch-old-101")
+        seed_pending_batch(store, 102, "batch-old-102")
+        clock = FakeClock(datetime(2026, 9, 5, 0, 10, tzinfo=UTC))
+        notifier = RecordingNotifier()
+
+        summary = run(
+            store,
+            SequenceSource(
+                [Page([make_post(103, "latest"), make_post(102), make_post(101)], exhausted=True)]
+            ),
+            clock,
+            notifier=notifier,
+            interval_seconds=0,
+            request_spacing_seconds=0,
+            send_spacing_seconds=0,
+        )
+
+        assert summary.batch_id is not None
+        assert notifier.digests[0].batch_id == summary.batch_id
+        assert notifier.digests[0].post_ids == ("103",)
+        assert {digest.batch_id for digest in notifier.digests[1:]} == {
+            "batch-old-101",
+            "batch-old-102",
+        }
+        assert summary.batch_state == SendState.ACCEPTED
+        assert summary.send_state == SendState.ACCEPTED
+        assert summary.send_count == 3
+        assert summary.sent_batch_ids[0] == summary.batch_id
+        assert summary.pending_send_count == 0
+        assert store.outbox_counts() == {"accepted": 3}
+    finally:
+        store.close()
+
+
 def test_pinned_does_not_define_boundary_and_multiple_pages_are_scanned() -> None:
     store = Store(":memory:")
     try:

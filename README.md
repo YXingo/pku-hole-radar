@@ -144,6 +144,59 @@ max_message_chars = 20000
 可取消的异步 HTTP 路径；若来源请求超时，不提交本轮采集结果；若通知请求已经启动但无法确认
 结果，则记为 `unknown`，不会自动重发造成重复消息。
 
+每轮采集完成后，程序优先发送本轮刚生成的当前批次，保证定时触发看到的是上一个采集区间的
+最新帖子；随后在同一轮剩余预算内继续排空已经到期的 pending 批次。批次之间默认间隔 13 秒，
+以遵守 PushPlus 每分钟 5 次的频率限制，可通过 `notify.send_spacing_seconds` 调整。渠道仍在冷却、
+当日额度耗尽或运行预算不足时，未发送完的积压保留到下一轮，但不再阻塞下一轮当前批次。
+
+## 关注摘要（可选）
+
+微信模板卡片通常优先展示标题。开启关注摘要后，程序会在现有通知批次内用本地规则识别实习、
+科研和相关交流，统计整批帖子，并把相关帖子排在前面；它不会改变采集、去重、水位或既有
+`filters.include_any` 的语义，也不会调用 AI。
+
+公开配置默认关闭：
+
+```toml
+[attention]
+enabled = false
+title_max_chars = 40
+max_title_categories = 2
+preferred_locations = []
+```
+
+用户可在本地 `config.toml` 中开启，并按优先顺序设置地点。针对 LLM4SE、Agent、实习和科研
+招募的配置示例：
+
+```toml
+[attention]
+enabled = true
+title_max_chars = 40
+max_title_categories = 2
+preferred_locations = ["深圳", "远程"]
+
+[attention.keywords]
+llm4se = ["LLM4SE", "AI4SE", "代码智能", "coding agent", "SWE-bench"]
+llm = ["大模型", "大语言模型", "大型语言模型", "LLM", "LLMs"]
+agent = ["智能体", "AI Agent", "多智能体", "coding agent", "Agent"]
+```
+
+未在配置中列出的分组沿用通用预设；把某个分组显式设为 `[]` 可关闭它。`深圳` 和 `远程` 只
+用于排序偏好，不是硬筛选条件。标题可能类似 `实习2·科研1｜43帖`、`实习2｜深圳 coding
+agent…｜43帖` 或无命中时的 `树洞雷达｜43帖·关注0`。这只是关键词规则线索，不代表职位仍
+在招聘、岗位真实有效或一定适合用户。
+
+可覆盖的分组及用途是：`llm4se`（LLM4SE/软件工程大模型）、`software_engineering`（代码
+生成/程序修复/测试生成等任务）、`llm`（大模型）、`agent`（Agent）、`internship`（实习）、
+`research`（研究助理/科研合作）、`recruitment`（招募信号）、`supporting_recruitment`
+（内推/岗位/投递等辅助信号）、`help_seeking`（求实习/求内推等求助语境）、`experience`
+（面经/投稿/复现等经验）、`shenzhen`（深圳）、`remote`（远程）和 `secondary`（RAG/工具
+调用/微调等辅助技术）。
+
+`notify.content_mode = "links_only"` 时，关注分类和计数仍可用于标题与详情排序，但不会向
+通知正文写入原文片段或命中词。关闭 `attention.enabled` 即恢复旧标题和旧排序；已保存的
+outbox 批次不会因修改词库而重新生成。
+
 ## 首次增量验收
 
 首次正式轮次只建立基线。建议按实际调度运行三轮：

@@ -123,6 +123,9 @@ class RunSummary:
     batch_id: str | None = None
     batch_state: SendState | None = None
     send_state: SendState | None = None
+    send_count: int = 0
+    sent_batch_ids: tuple[str, ...] = ()
+    pending_send_count: int = 0
     skipped: bool = False
     error_kind: ErrorKind | None = None
     error_message: str | None = None

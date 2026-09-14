@@ -94,6 +94,7 @@ class RunnerSettings:
     max_send_attempts: int = 3
     daily_send_limit: int = 60
     pending_ttl_hours: float = 24
+    send_spacing_seconds: float = 13
     send_retry_spacing_seconds: float = 1800
     cleanup_interval_seconds: float = 86400
     cleanup_batch_size: int = 500
@@ -112,8 +113,16 @@ class _Budget:
         return self.deadline_mono - current_mono
 
 
+@dataclass(frozen=True, slots=True)
+class _SendOutcome:
+    batch_id: str | None = None
+    state: SendState | None = None
+    error_kind: ErrorKind | None = None
+    error_message: str | None = None
+
+
 class Runner:
-    """执行一次有界采集和最多一次投递；网络请求不在数据库事务内。"""
+    """执行一次有界采集，优先投递当前批次并在预算内排空积压。"""
 
     def __init__(
         self,
@@ -686,41 +695,71 @@ class Runner:
                 error_message=summary.error_message or "剩余运行预算不足，未启动通知发送",
                 elapsed_seconds=self._elapsed(started_mono),
             )
-        now = self.clock.now()
-        send_state, batch_state, send_error_kind, send_error_message = self._send_one(now, budget)
-        if send_state is None:
-            if summary.batch_id and batch_state is None:
-                batch_state = self.store.latest_outbox_status(summary.batch_id)
-            return replace(
-                summary,
-                batch_state=batch_state or summary.batch_state,
-                error_kind=summary.error_kind or send_error_kind,
-                error_message=summary.error_message or send_error_message,
-                elapsed_seconds=self._elapsed(started_mono),
+        outcomes: list[_SendOutcome] = []
+        preferred_batch_id = summary.batch_id
+        send_error_kind: ErrorKind | None = None
+        send_error_message: str | None = None
+
+        while not self._budget_expired(budget):
+            outcome = self._send_one(
+                self.clock.now(),
+                budget,
+                preferred_batch_id=preferred_batch_id,
             )
-        error_kind = summary.error_kind or send_error_kind
-        error_message = summary.error_message or send_error_message
-        return RunSummary(
-            run_id=summary.run_id,
-            pages=summary.pages,
-            request_count=summary.request_count,
-            new_count=summary.new_count,
-            matched_count=summary.matched_count,
-            coverage=summary.coverage,
-            batch_id=summary.batch_id,
+            preferred_batch_id = None
+            if outcome.batch_id is None:
+                send_error_kind = send_error_kind or outcome.error_kind
+                send_error_message = send_error_message or outcome.error_message
+                break
+            outcomes.append(outcome)
+            send_error_kind = send_error_kind or outcome.error_kind
+            send_error_message = send_error_message or outcome.error_message
+            if outcome.state not in {SendState.ACCEPTED, SendState.DELIVERED}:
+                break
+            if self.store.due_outbox_count(self.clock.now()) == 0:
+                break
+            spacing = self.settings.send_spacing_seconds
+            if spacing > 0:
+                if budget.remaining(self.clock.monotonic()) <= spacing:
+                    send_error_kind = send_error_kind or ErrorKind.TEMPORARY
+                    send_error_message = send_error_message or (
+                        "剩余运行预算不足，积压通知将在下轮继续发送"
+                    )
+                    break
+                self.clock.sleep(spacing)
+
+        batch_state = (
+            self.store.latest_outbox_status(summary.batch_id)
+            if summary.batch_id
+            else summary.batch_state
+        )
+        pending_count = self.store.outbox_counts().get(SendState.PENDING.value, 0)
+        return replace(
+            summary,
             batch_state=batch_state,
-            send_state=send_state,
-            skipped=summary.skipped,
-            error_kind=error_kind,
-            error_message=error_message,
+            send_state=outcomes[-1].state if outcomes else None,
+            send_count=len(outcomes),
+            sent_batch_ids=tuple(
+                outcome.batch_id for outcome in outcomes if outcome.batch_id is not None
+            ),
+            pending_send_count=pending_count,
+            error_kind=summary.error_kind or send_error_kind,
+            error_message=summary.error_message or send_error_message,
             elapsed_seconds=self._elapsed(started_mono),
         )
 
     def _send_one(
-        self, now: datetime, budget: _Budget
-    ) -> tuple[SendState | None, SendState | None, ErrorKind | None, str | None]:
+        self,
+        now: datetime,
+        budget: _Budget,
+        *,
+        preferred_batch_id: str | None = None,
+    ) -> _SendOutcome:
         if self._budget_expired(budget):
-            return None, None, ErrorKind.TEMPORARY, "剩余运行预算不足，未启动通知发送"
+            return _SendOutcome(
+                error_kind=ErrorKind.TEMPORARY,
+                error_message="剩余运行预算不足，未启动通知发送",
+            )
         day_start, day_end = _day_bounds(now, self.settings.timezone)
         decision: ClaimDecision = self.store.claim_outbox(
             now=now,
@@ -729,14 +768,21 @@ class Runner:
             day_end=day_end,
             pending_ttl=timedelta(hours=self.settings.pending_ttl_hours),
             max_attempts=self.settings.max_send_attempts,
+            preferred_batch_id=preferred_batch_id,
         )
         claim = decision.claim
         if claim is None:
             if decision.reason == "notification_channel_cooldown":
-                return None, None, ErrorKind.RATE_LIMIT, "通知渠道仍在冷却期"
+                return _SendOutcome(
+                    error_kind=ErrorKind.RATE_LIMIT,
+                    error_message="通知渠道仍在冷却期",
+                )
             if decision.reason == "daily_send_budget_exhausted":
-                return None, None, ErrorKind.QUOTA, "今日通知尝试预算已用尽"
-            return None, None, None, None
+                return _SendOutcome(
+                    error_kind=ErrorKind.QUOTA,
+                    error_message="今日通知尝试预算已用尽",
+                )
+            return _SendOutcome()
         from .models import Digest
 
         digest = Digest(
@@ -758,7 +804,12 @@ class Runner:
                 + timedelta(seconds=self.settings.send_retry_spacing_seconds),
             )
             self.store.finish_send(claim.attempt_id, now=self.clock.now(), result=result)
-            return result.state, result.state, result.error_kind, result.error_message
+            return _SendOutcome(
+                batch_id=claim.batch_id,
+                state=result.state,
+                error_kind=result.error_kind,
+                error_message=result.error_message,
+            )
         try:
             bounded_send = getattr(self.notifier, "send_with_timeout", None)
             if callable(bounded_send):
@@ -795,7 +846,12 @@ class Runner:
                 retry_at=retry_at,
             )
         self.store.finish_send(claim.attempt_id, now=self.clock.now(), result=result)
-        return result.state, result.state, result.error_kind, result.error_message
+        return _SendOutcome(
+            batch_id=claim.batch_id,
+            state=result.state,
+            error_kind=result.error_kind,
+            error_message=result.error_message,
+        )
 
     def _cleanup_if_due(self, now: datetime) -> None:
         last_cleanup = _parse_optional_iso(self.store.get_state("last_cleanup_at"))

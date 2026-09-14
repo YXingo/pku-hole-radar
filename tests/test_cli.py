@@ -31,6 +31,27 @@ def test_fixture_preview_uses_temporary_state_and_never_creates_production_db(
     assert not (tmp_path / "production-state").exists()
 
 
+def test_attention_fixture_preview_uses_the_same_runner_digest_path(tmp_path: Path, capsys) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        Path("config.example.toml")
+        .read_text(encoding="utf-8")
+        .replace('state_dir = "var"', 'state_dir = "production-state"')
+        .replace('secrets_file = ".env"', 'secrets_file = "secrets.env"')
+        .replace("enabled = false", "enabled = true")
+        .replace("preferred_locations = []", 'preferred_locations = ["深圳", "远程"]'),
+        encoding="utf-8",
+    )
+    fixture = Path("tests/fixtures/attention.json").resolve()
+    exit_code = main(["--config", str(config), "preview", "--fixture", str(fixture)])
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "实习1·科研1" in output
+    assert "关注概览（关键词规则）：实习线索 1，科研线索 1" in output
+    assert "深圳团队招聘 coding agent 实习生" in output
+    assert not (tmp_path / "production-state").exists()
+
+
 def test_live_command_missing_configuration_returns_config_error_without_network(
     tmp_path: Path, capsys
 ) -> None:

@@ -53,6 +53,48 @@ def make_batch(
     )
 
 
+def test_claim_outbox_prefers_current_batch_before_older_backlog() -> None:
+    store = Store(":memory:")
+    try:
+        make_batch(store, created_at=NOW, post_id="101", batch_id="batch-old")
+        current_time = NOW + timedelta(minutes=10)
+        make_batch(
+            store,
+            created_at=current_time,
+            post_id="102",
+            batch_id="batch-current",
+        )
+        day_start, day_end = day_bounds()
+
+        current = store.claim_outbox(
+            now=current_time,
+            daily_limit=60,
+            day_start=day_start,
+            day_end=day_end,
+            pending_ttl=timedelta(hours=24),
+            preferred_batch_id="batch-current",
+        ).claim
+        assert current is not None
+        assert current.batch_id == "batch-current"
+        store.finish_send(
+            current.attempt_id,
+            current_time,
+            SendResult(SendState.ACCEPTED, provider_receipt="current"),
+        )
+
+        backlog = store.claim_outbox(
+            now=current_time,
+            daily_limit=60,
+            day_start=day_start,
+            day_end=day_end,
+            pending_ttl=timedelta(hours=24),
+        ).claim
+        assert backlog is not None
+        assert backlog.batch_id == "batch-old"
+    finally:
+        store.close()
+
+
 def test_unknown_after_restart_is_not_auto_retried_and_requires_ack() -> None:
     store = Store(":memory:")
     try:

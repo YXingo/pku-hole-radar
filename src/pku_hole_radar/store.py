@@ -235,6 +235,7 @@ class Store:
         day_end: datetime,
         pending_ttl: timedelta,
         max_attempts: int = 3,
+        preferred_batch_id: str | None = None,
     ) -> ClaimDecision:
         if max_attempts <= 0:
             raise ValueError("max_attempts 必须为正数")
@@ -290,10 +291,11 @@ class Store:
                 FROM outbox
                 WHERE status = ? AND (attempts < ? OR last_error_kind = 'manual_retry_acknowledged')
                   AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
-                ORDER BY next_attempt_at ASC, created_at ASC
+                ORDER BY CASE WHEN batch_id = ? THEN 0 ELSE 1 END,
+                         next_attempt_at ASC, created_at ASC
                 LIMIT 1
                 """,
-                (SendState.PENDING.value, max_attempts, now_text),
+                (SendState.PENDING.value, max_attempts, now_text, preferred_batch_id),
             ).fetchone()
             if row is None:
                 return ClaimDecision(None, "no_due_outbox")
@@ -699,6 +701,17 @@ class Store:
             "SELECT status FROM outbox WHERE batch_id = ?", (batch_id,)
         ).fetchone()
         return None if row is None else SendState(str(row["status"]))
+
+    def due_outbox_count(self, now: datetime) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM outbox
+            WHERE status = ? AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
+            """,
+            (SendState.PENDING.value, _iso(now)),
+        ).fetchone()
+        return int(row["count"])
 
     def list_outbox(
         self, *, status: SendState | str | None = None, limit: int = 50

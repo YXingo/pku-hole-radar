@@ -4,7 +4,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -14,6 +14,8 @@ try:  # Python 3.11+ 标准库；保留 tomli 仅用于本机旧 Python 的离�
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - 仅在 Python 3.10 及更早版本触发
     import tomli as tomllib  # type: ignore[no-redef]
+
+from .attention import AttentionSettings
 
 
 class ConfigError(ValueError):
@@ -89,6 +91,7 @@ class NotifySettings:
     max_message_chars: int
     max_send_attempts_per_day: int
     pending_ttl_hours: float
+    send_spacing_seconds: float
     send_retry_spacing_seconds: float
 
 
@@ -100,6 +103,7 @@ class AppConfig:
     source: SourceSettings
     filters: FilterSettings
     notify: NotifySettings
+    attention: AttentionSettings = field(default_factory=AttentionSettings)
 
     def validate_for(self, command: str, secrets: Mapping[str, str]) -> None:
         if command in {"run-once", "probe-source", "preview-live", "baseline-reset"}:
@@ -198,6 +202,42 @@ def load_config(path: str | Path) -> AppConfig:
         exclude_any=_keywords(filters_raw, "exclude_any"),
     )
 
+    attention_raw = _table(raw, "attention")
+    unknown_attention = set(attention_raw) - {
+        "enabled",
+        "title_max_chars",
+        "max_title_categories",
+        "preferred_locations",
+        "keywords",
+    }
+    if unknown_attention:
+        raise ConfigError("attention 包含不支持的字段：" + ", ".join(sorted(unknown_attention)))
+    keyword_groups = attention_raw.get("keywords", {})
+    if not isinstance(keyword_groups, dict):
+        raise ConfigError("attention.keywords 必须是 TOML 表")
+    attention_keywords: dict[str, tuple[str, ...]] = {}
+    for group, values in keyword_groups.items():
+        if not isinstance(group, str):
+            raise ConfigError("attention.keywords 分组名必须是字符串")
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise ConfigError(f"attention.keywords.{group} 必须是字符串数组")
+        attention_keywords[group] = tuple(values)
+    preferred_locations = attention_raw.get("preferred_locations", [])
+    if not isinstance(preferred_locations, list) or any(
+        not isinstance(item, str) for item in preferred_locations
+    ):
+        raise ConfigError("attention.preferred_locations 必须是字符串数组")
+    try:
+        attention = AttentionSettings(
+            enabled=_bool(attention_raw, "enabled", False),
+            title_max_chars=_positive_int(attention_raw, "title_max_chars", 40),
+            max_title_categories=_positive_int(attention_raw, "max_title_categories", 2),
+            preferred_locations=tuple(preferred_locations),
+            keywords=attention_keywords,
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
     notify_raw = _table(raw, "notify")
     notify = NotifySettings(
         provider=_string(notify_raw, "provider", "stdout").strip().lower(),
@@ -209,6 +249,7 @@ def load_config(path: str | Path) -> AppConfig:
         max_message_chars=_positive_int(notify_raw, "max_message_chars", 6000),
         max_send_attempts_per_day=_positive_int(notify_raw, "max_send_attempts_per_day", 60),
         pending_ttl_hours=_positive_float(notify_raw, "pending_ttl_hours", 24),
+        send_spacing_seconds=_nonnegative_float(notify_raw, "send_spacing_seconds", 13),
         send_retry_spacing_seconds=_nonnegative_float(
             notify_raw, "send_retry_spacing_seconds", 1800
         ),
@@ -233,6 +274,7 @@ def load_config(path: str | Path) -> AppConfig:
         poll=poll,
         source=source,
         filters=filters,
+        attention=attention,
         notify=notify,
     )
 

@@ -40,6 +40,7 @@ snippet_chars = 120
 max_message_chars = 6000
 max_send_attempts_per_day = 60
 pending_ttl_hours = 24
+send_spacing_seconds = 13
 send_retry_spacing_seconds = 1800
 """,
         encoding="utf-8",
@@ -53,6 +54,8 @@ def test_config_resolves_paths_relative_to_config_file(tmp_path: Path) -> None:
     assert config.app.secrets_file == (tmp_path / ".env").resolve()
     assert config.poll.page_size == 30
     assert config.notify.provider == "stdout"
+    assert config.notify.send_spacing_seconds == 13
+    assert config.attention.enabled is False
 
 
 def test_blank_keyword_is_rejected(tmp_path: Path) -> None:

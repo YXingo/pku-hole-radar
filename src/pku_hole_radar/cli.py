@@ -517,6 +517,7 @@ def _make_notifier(config, secrets: dict[str, str]):
 def _runner_settings(config, *, fixture: bool = False) -> RunnerSettings:
     options = DigestOptions(
         timezone=config.app.timezone,
+        attention=config.attention,
         content_mode=config.notify.content_mode,
         max_items=config.notify.max_items,
         snippet_chars=config.notify.snippet_chars,
@@ -536,6 +537,7 @@ def _runner_settings(config, *, fixture: bool = False) -> RunnerSettings:
         run_timeout_seconds=config.poll.run_timeout_seconds,
         daily_send_limit=config.notify.max_send_attempts_per_day,
         pending_ttl_hours=config.notify.pending_ttl_hours,
+        send_spacing_seconds=config.notify.send_spacing_seconds,
         send_retry_spacing_seconds=config.notify.send_retry_spacing_seconds,
         cleanup_interval_seconds=86400,
         cleanup_batch_size=500,
@@ -557,18 +559,25 @@ def _print_summary(summary) -> None:
     print(
         f"轮次 {summary.run_id}：页 {summary.pages}，请求 {summary.request_count}，"
         f"新增 {summary.new_count}，匹配 {summary.matched_count}，覆盖 {coverage}，"
-        f"批次 {batch_state}，发送 {send_state}，耗时 {summary.elapsed_seconds:.1f}s"
+        f"当前批次 {batch_state}，本轮发送 {summary.send_count} 批/{send_state}，"
+        f"待发送 {summary.pending_send_count} 批，耗时 {summary.elapsed_seconds:.1f}s"
     )
     logging.getLogger("pku_hole_radar").info(
-        "run_id=%s pages=%s requests=%s new=%s matched=%s coverage=%s batch_state=%s send_state=%s",
+        "run_id=%s pages=%s requests=%s new=%s matched=%s coverage=%s "
+        "current_batch_id=%s current_batch_state=%s sent_count=%s sent_batch_ids=%s "
+        "send_state=%s pending_count=%s",
         summary.run_id,
         summary.pages,
         summary.request_count,
         summary.new_count,
         summary.matched_count,
         coverage,
+        summary.batch_id,
         batch_state,
+        summary.send_count,
+        ",".join(summary.sent_batch_ids) or "none",
         send_state,
+        summary.pending_send_count,
     )
     if summary.error_message:
         print(f"结果说明：{summary.error_message}", file=sys.stderr)

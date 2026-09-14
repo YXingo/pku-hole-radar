@@ -1,0 +1,52 @@
+{
+  "pages": [
+    {
+      "posts": [
+        {
+          "id": "207",
+          "created_at": "2026-09-05T08:07:00Z",
+          "text": "深圳团队招聘 coding agent 实习生，欢迎投递简历",
+          "url": "https://fixture.test/post/207"
+        },
+        {
+          "id": "206",
+          "created_at": "2026-09-05T08:06:00Z",
+          "text": "课题组招募 LLM 研究助理，支持远程",
+          "url": "https://fixture.test/post/206"
+        },
+        {
+          "id": "205",
+          "created_at": "2026-09-05T08:05:00Z",
+          "text": "求深圳大模型实习，有没有内推",
+          "url": "https://fixture.test/post/205"
+        },
+        {
+          "id": "204",
+          "created_at": "2026-09-05T08:04:00Z",
+          "text": "大模型实习面经，分享面试经验",
+          "url": "https://fixture.test/post/204"
+        },
+        {
+          "id": "203",
+          "created_at": "2026-09-05T08:03:00Z",
+          "text": "本组大模型实习生已招满",
+          "url": "https://fixture.test/post/203"
+        },
+        {
+          "id": "202",
+          "created_at": "2026-09-05T08:02:00Z",
+          "text": "招聘无关运营实习；另有普通校园信息",
+          "url": "https://fixture.test/post/202"
+        },
+        {
+          "id": "201",
+          "created_at": "2026-09-05T08:01:00Z",
+          "text": "普通树洞：今天天气不错",
+          "url": "https://fixture.test/post/201"
+        }
+      ],
+      "exhausted": true,
+      "total": 7
+    }
+  ]
+}
