@@ -10,7 +10,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .models import ErrorKind, Page, Post
+from .models import Comment, CommentPage, ErrorKind, Page, Post
 
 
 class SourceError(RuntimeError):
@@ -33,15 +33,24 @@ class Source(Protocol):
     def fetch_page(self, page_token: str | None, page_size: int) -> Page:
         """获取一个列表页；page_token 对调用方保持不透明。"""
 
+    def fetch_comments(self, post_id: str, page_token: str | None, page_size: int) -> CommentPage:
+        """按时间正序获取一个帖子的公开可见回复。"""
+
 
 class FixtureSource:
     """只读 JSON fixture 来源；绝不创建网络客户端。"""
 
-    def __init__(self, pages: list[Page | SourceError]) -> None:
+    def __init__(
+        self,
+        pages: list[Page | SourceError],
+        comments_by_post: dict[str, tuple[Comment, ...]] | None = None,
+    ) -> None:
         if not pages:
             raise ValueError("fixture 至少需要一个 page")
         self._pages = pages
+        self._comments_by_post = comments_by_post or {}
         self.calls: list[tuple[str | None, int]] = []
+        self.comment_calls: list[tuple[str, str | None, int]] = []
 
     @classmethod
     def from_file(cls, path: str | Path) -> FixtureSource:
@@ -95,13 +104,33 @@ class FixtureSource:
             raise result
         return result
 
+    def fetch_comments(self, post_id: str, page_token: str | None, page_size: int) -> CommentPage:
+        self.comment_calls.append((post_id, page_token, page_size))
+        page = _page_number(page_token)
+        comments = self._comments_by_post.get(post_id, ())
+        start = (page - 1) * page_size
+        selected = list(comments[start : start + page_size])
+        exhausted = start + len(selected) >= len(comments)
+        return CommentPage(
+            comments=selected,
+            next_page=None if exhausted else str(page + 1),
+            exhausted=exhausted,
+            total=len(comments),
+        )
+
 
 class SequenceSource:
     """测试替身：按调用顺序返回 page 或抛出结构化来源错误。"""
 
-    def __init__(self, responses: list[Page | SourceError]) -> None:
+    def __init__(
+        self,
+        responses: list[Page | SourceError],
+        comments_by_post: dict[str, tuple[Comment, ...] | SourceError] | None = None,
+    ) -> None:
         self.responses = responses
+        self.comments_by_post = comments_by_post or {}
         self.calls: list[tuple[str | None, int]] = []
+        self.comment_calls: list[tuple[str, str | None, int]] = []
 
     def fetch_page(self, page_token: str | None, page_size: int) -> Page:
         self.calls.append((page_token, page_size))
@@ -111,6 +140,22 @@ class SequenceSource:
         if isinstance(response, SourceError):
             raise response
         return response
+
+    def fetch_comments(self, post_id: str, page_token: str | None, page_size: int) -> CommentPage:
+        self.comment_calls.append((post_id, page_token, page_size))
+        response = self.comments_by_post.get(post_id, ())
+        if isinstance(response, SourceError):
+            raise response
+        page = _page_number(page_token)
+        start = (page - 1) * page_size
+        selected = list(response[start : start + page_size])
+        exhausted = start + len(selected) >= len(response)
+        return CommentPage(
+            comments=selected,
+            next_page=None if exhausted else str(page + 1),
+            exhausted=exhausted,
+            total=len(response),
+        )
 
 
 class LiveTreeholeSource:
@@ -149,6 +194,12 @@ class LiveTreeholeSource:
         if not token.strip():
             raise ValueError("树洞 token 不能为空")
         self.endpoint = endpoint
+        comment_suffix = "/hole/list_comments"
+        self.comment_endpoint = (
+            parsed._replace(path=parsed.path[: -len(comment_suffix)] + "/comment/list").geturl()
+            if parsed.path.endswith(comment_suffix)
+            else ""
+        )
         self.post_url_template = post_url_template or ""
         self._connect_timeout_seconds = connect_timeout_seconds
         self._read_timeout_seconds = read_timeout_seconds
@@ -224,9 +275,92 @@ class LiveTreeholeSource:
             "comment_limit": "0",
             "comment_stream": "1",
         }
+        data = self._request_data(
+            self.endpoint,
+            params=params,
+            timeout_seconds=timeout_seconds,
+        )
+        total = data.get("total")
+        if total is not None and (isinstance(total, bool) or not isinstance(total, int)):
+            raise SourceError(ErrorKind.CONTRACT, "树洞 data.total 不是整数")
+        posts = [_post_from_live(item, self.post_url_template) for item in data["list"]]
+        exhausted = total is not None and page * page_size >= total
+        return Page(
+            posts=posts,
+            next_page=None if exhausted else str(page + 1),
+            exhausted=exhausted,
+            total=total,
+        )
+
+    def fetch_comments(self, post_id: str, page_token: str | None, page_size: int) -> CommentPage:
+        return self._fetch_comments(post_id, page_token, page_size, timeout_seconds=None)
+
+    def fetch_comments_with_timeout(
+        self,
+        post_id: str,
+        page_token: str | None,
+        page_size: int,
+        *,
+        timeout_seconds: float,
+    ) -> CommentPage:
+        if timeout_seconds <= 0:
+            raise SourceError(ErrorKind.TEMPORARY, "没有剩余的回复请求时间预算")
+        return self._fetch_comments(
+            post_id,
+            page_token,
+            page_size,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _fetch_comments(
+        self,
+        post_id: str,
+        page_token: str | None,
+        page_size: int,
+        *,
+        timeout_seconds: float | None,
+    ) -> CommentPage:
+        if not re.fullmatch(r"[0-9]+", post_id):
+            raise ValueError("帖子 ID 必须是十进制字符串")
+        if page_size <= 0:
+            raise ValueError("回复 page_size 必须是正数")
+        if not self.comment_endpoint:
+            raise SourceError(ErrorKind.CONTRACT, "无法从列表地址确定树洞回复接口")
+        page = _page_number(page_token)
+        data = self._request_data(
+            self.comment_endpoint,
+            params={
+                "pid": post_id,
+                "page": str(page),
+                "limit": str(page_size),
+                "sort": "0",
+                # 实测 stream=1 的 data.total 会退化为请求 limit；0 才能可靠分页取全。
+                "comment_stream": "0",
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        total = data.get("total")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise SourceError(ErrorKind.CONTRACT, "树洞回复 data.total 不是非负整数")
+        comments = [_comment_from_live(item, expected_post_id=post_id) for item in data["list"]]
+        exhausted = page * page_size >= total or len(comments) < page_size
+        return CommentPage(
+            comments=comments,
+            next_page=None if exhausted else str(page + 1),
+            exhausted=exhausted,
+            total=total,
+        )
+
+    def _request_data(
+        self,
+        url: str,
+        *,
+        params: dict[str, str],
+        timeout_seconds: float | None,
+    ) -> dict[str, Any]:
         try:
             if timeout_seconds is None:
-                response = self.client.get(self.endpoint, params=params, headers=self._headers)
+                response = self.client.get(url, params=params, headers=self._headers)
             else:
                 effective_timeout = min(timeout_seconds, self._read_timeout_seconds)
                 timeout = httpx.Timeout(
@@ -239,16 +373,16 @@ class LiveTreeholeSource:
                 if self._owns_client or self._async_transport is not None:
                     response = asyncio.run(
                         self._async_get(
+                            url=url,
                             params=params,
                             timeout=timeout,
                             timeout_seconds=timeout_seconds,
                         )
                     )
                 else:
-                    # 仅保留给注入的同步测试 transport；生产客户端走上面的可取消
-                    # AsyncClient 路径，避免同步读取阻塞整轮预算。
+                    # 注入的同步测试 transport 不支持由 asyncio 取消；生产客户端走上方路径。
                     response = self.client.get(
-                        self.endpoint,
+                        url,
                         params=params,
                         headers=self._headers,
                         timeout=timeout,
@@ -278,7 +412,7 @@ class LiveTreeholeSource:
             target = urlparse(location)
             if target.hostname and target.hostname != "treehole.pku.edu.cn":
                 raise SourceError(ErrorKind.ACCESS_DENIED, "树洞请求发生跨域重定向")
-            raise SourceError(ErrorKind.CONTRACT, "树洞列表不应返回重定向")
+            raise SourceError(ErrorKind.CONTRACT, "树洞读取请求不应返回重定向")
         if response.status_code == 401:
             raise SourceError(ErrorKind.AUTH, "树洞会话无效或已过期")
         if response.status_code == 403:
@@ -318,21 +452,12 @@ class LiveTreeholeSource:
         data = envelope.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("list"), list):
             raise SourceError(ErrorKind.CONTRACT, "树洞响应缺少 data.list 数组")
-        total = data.get("total")
-        if total is not None and (isinstance(total, bool) or not isinstance(total, int)):
-            raise SourceError(ErrorKind.CONTRACT, "树洞 data.total 不是整数")
-        posts = [_post_from_live(item, self.post_url_template) for item in data["list"]]
-        exhausted = total is not None and page * page_size >= total
-        return Page(
-            posts=posts,
-            next_page=None if exhausted else str(page + 1),
-            exhausted=exhausted,
-            total=total,
-        )
+        return data
 
     async def _async_get(
         self,
         *,
+        url: str,
         params: dict[str, str],
         timeout: httpx.Timeout,
         timeout_seconds: float,
@@ -347,7 +472,7 @@ class LiveTreeholeSource:
             client_kwargs["transport"] = self._async_transport
         async with httpx.AsyncClient(**client_kwargs) as client:
             return await asyncio.wait_for(
-                client.get(self.endpoint, params=params, headers=self._headers),
+                client.get(url, params=params, headers=self._headers),
                 timeout=timeout_seconds,
             )
 
@@ -408,6 +533,54 @@ def _post_from_live(raw: Any, link_template: str | None) -> Post:
         is_pinned=_truthy_flag(raw.get("is_top", 0)),
         has_media=has_media,
     )
+
+
+def _comment_from_live(raw: Any, *, expected_post_id: str) -> Comment:
+    if not isinstance(raw, dict):
+        raise SourceError(ErrorKind.CONTRACT, "树洞 data.list 回复不是对象")
+    cid = raw.get("cid")
+    pid = raw.get("pid")
+    if isinstance(cid, bool) or cid is None or not re.fullmatch(r"[0-9]+", str(cid)):
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复缺少有效 cid")
+    if isinstance(pid, bool) or pid is None or not re.fullmatch(r"[0-9]+", str(pid)):
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复缺少有效 pid")
+    post_id = str(pid)
+    if post_id != expected_post_id:
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复所属帖子与请求不一致")
+    timestamp = raw.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int | float):
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复 timestamp 不是数字")
+    try:
+        created_at = datetime.fromtimestamp(float(timestamp), tz=UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复 timestamp 无法转换") from exc
+    text = raw.get("text", "")
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        raise SourceError(ErrorKind.CONTRACT, "树洞回复 text 不是字符串")
+    media_ids = raw.get("media_ids", "")
+    return Comment(
+        id=str(cid),
+        post_id=post_id,
+        created_at=created_at,
+        text=text,
+        is_author=_truthy_flag(raw.get("is_author", raw.get("is_lz", 0))),
+        has_media=bool(media_ids and str(media_ids) not in {"0", "[]"}),
+        quote_id=_quote_id(raw.get("quote")),
+    )
+
+
+def _quote_id(raw: Any) -> str | None:
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if not isinstance(raw, dict):
+        return None
+    cid = raw.get("cid")
+    if isinstance(cid, bool) or cid is None:
+        return None
+    value = str(cid)
+    return value if re.fullmatch(r"[0-9]+", value) else None
 
 
 def _fixture_error(raw: Any) -> SourceError:

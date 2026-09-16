@@ -84,6 +84,50 @@ def test_live_adapter_maps_verified_shape_and_does_not_put_auth_in_url() -> None
     assert request.headers["uuid"] == "local-uuid"
 
 
+def test_live_adapter_fetches_all_comment_pages_with_reliable_stream_mode() -> None:
+    requests: list[httpx.Request] = []
+
+    def row(cid: int, *, quote: object = None) -> dict[str, object]:
+        return {
+            "cid": cid,
+            "pid": 123,
+            "text": f"完整回复 {cid}",
+            "timestamp": 1_757_020_800 + cid,
+            "is_author": 1 if cid == 1 else 0,
+            "media_ids": "[]",
+            "quote": [] if quote is None else quote,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path.endswith("/chapi/api/v3/comment/list")
+        page = int(request.url.params["page"])
+        comments = [row(1), row(2)] if page == 1 else [row(3, quote={"cid": 2})]
+        return httpx.Response(
+            200,
+            json={"code": 20000, "data": {"list": comments, "total": 3}},
+        )
+
+    source = live_source(handler)
+    try:
+        first = source.fetch_comments("123", None, 2)
+        second = source.fetch_comments("123", first.next_page, 2)
+    finally:
+        source.close()
+
+    assert first.total == 3
+    assert first.exhausted is False
+    assert first.next_page == "2"
+    assert [comment.text for comment in first.comments] == ["完整回复 1", "完整回复 2"]
+    assert first.comments[0].is_author is True
+    assert second.exhausted is True
+    assert second.next_page is None
+    assert second.comments[0].quote_id == "2"
+    assert all(request.url.params["comment_stream"] == "0" for request in requests)
+    assert all(request.url.params["sort"] == "0" for request in requests)
+    assert all("local-token" not in str(request.url) for request in requests)
+
+
 @pytest.mark.parametrize(
     ("response", "kind"),
     [

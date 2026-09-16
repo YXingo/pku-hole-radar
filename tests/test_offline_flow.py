@@ -6,8 +6,19 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from pku_hole_radar.attention import AttentionSettings
 from pku_hole_radar.digest import DigestOptions
-from pku_hole_radar.models import Coverage, Digest, ErrorKind, Page, Post, SendResult, SendState
+from pku_hole_radar.models import (
+    Comment,
+    CommentPage,
+    Coverage,
+    Digest,
+    ErrorKind,
+    Page,
+    Post,
+    SendResult,
+    SendState,
+)
 from pku_hole_radar.runner import LockBusy, ProcessLock, Runner, RunnerSettings
 from pku_hole_radar.source import SequenceSource, SourceError
 from pku_hole_radar.store import Store, StoreError
@@ -70,6 +81,18 @@ class AdvancingSource:
         return self.page
 
 
+class ChangingCommentTotalSource(SequenceSource):
+    def __init__(self, responses: list[Page], comment_pages: list[CommentPage]) -> None:
+        super().__init__(responses)
+        self.comment_pages = comment_pages
+
+    def fetch_comments(self, post_id: str, page_token: str | None, page_size: int) -> CommentPage:
+        self.comment_calls.append((post_id, page_token, page_size))
+        if not self.comment_pages:
+            raise SourceError(ErrorKind.CONTRACT, "测试来源没有更多回复页")
+        return self.comment_pages.pop(0)
+
+
 class AdvancingCommitStore(Store):
     def __init__(self, clock: FakeClock, seconds: float) -> None:
         super().__init__(":memory:")
@@ -89,6 +112,15 @@ def make_post(post_id: int, text: str = "fixture", *, pinned: bool = False) -> P
         text=text,
         url=f"https://fixture.test/post/{post_id}",
         is_pinned=pinned,
+    )
+
+
+def make_comment(comment_id: int, post_id: int, text: str) -> Comment:
+    return Comment(
+        id=str(comment_id),
+        post_id=str(post_id),
+        created_at=datetime(2026, 9, 5, 1, 0, tzinfo=UTC) + timedelta(seconds=comment_id),
+        text=text,
     )
 
 
@@ -220,6 +252,230 @@ def test_baseline_then_restart_dedupe_and_single_batch(tmp_path: Path) -> None:
         assert third.batch_id is None
         assert notifier.digests == []
         assert restarted.outbox_counts() == {"accepted": 1}
+
+
+def test_notification_threshold_accumulates_across_restarts_and_is_strict(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    clock = FakeClock(datetime(2026, 9, 5, tzinfo=UTC))
+    with Store(database) as store:
+        seed_watermark(store)
+        notifier = RecordingNotifier()
+        first = run(
+            store,
+            SequenceSource(
+                [
+                    Page(
+                        [make_post(post_id, "普通帖子") for post_id in range(200, 100, -1)],
+                        exhausted=True,
+                    )
+                ]
+            ),
+            clock,
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+        )
+        assert first.batch_id is None
+        assert notifier.digests == []
+        assert store.pending_notification_count() == 100
+        assert store.baseline() == (True, "200")
+
+    clock.advance(1800)
+    with Store(database) as restarted:
+        notifier = RecordingNotifier()
+        second = run(
+            restarted,
+            SequenceSource([Page([make_post(201, "第 101 条")], exhausted=True)]),
+            clock,
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+        )
+        assert second.batch_id is not None
+        assert len(notifier.digests) == 1
+        assert notifier.digests[0].post_count == 101
+        assert len(notifier.digests[0].post_ids) == 101
+        assert restarted.pending_notification_count() == 0
+
+
+def test_attention_bypasses_threshold_and_includes_complete_comments() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store)
+        clock = FakeClock(datetime(2026, 9, 5, tzinfo=UTC))
+        focused = make_post(102, "深圳团队招聘 coding agent 实习生。完整岗位说明。")
+        ordinary = make_post(101, "普通帖子")
+        source = SequenceSource(
+            [Page([focused, ordinary], exhausted=True)],
+            comments_by_post={
+                "102": (
+                    make_comment(1, 102, "第一条完整回复"),
+                    make_comment(2, 102, "第二条完整回复"),
+                )
+            },
+        )
+        notifier = RecordingNotifier()
+        summary = run(
+            store,
+            source,
+            clock,
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            digest_options=DigestOptions(
+                timezone=ZoneInfo("Asia/Shanghai"),
+                attention=AttentionSettings(enabled=True, preferred_locations=("深圳", "远程")),
+                max_items=0,
+                max_message_chars=20_000,
+                allowed_hosts=frozenset({"fixture.test"}),
+            ),
+        )
+
+        assert summary.batch_id is not None
+        assert source.comment_calls == [("102", None, 50)]
+        assert len(notifier.digests) == 1
+        content = notifier.digests[0].content
+        assert content.index("完整岗位说明") < content.index("普通帖子")
+        assert "第一条完整回复" in content
+        assert "第二条完整回复" in content
+        assert store.pending_notification_count() == 0
+    finally:
+        store.close()
+
+
+def test_links_only_attention_does_not_fetch_or_expose_comments() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store)
+        clock = FakeClock(datetime(2026, 9, 5, tzinfo=UTC))
+        focused = make_post(101, "深圳团队招聘 coding agent 实习生")
+        source = SequenceSource(
+            [Page([focused], exhausted=True)],
+            comments_by_post={"101": SourceError(ErrorKind.TEMPORARY_NOT_SENT, "不应请求回复接口")},
+        )
+        notifier = RecordingNotifier()
+        summary = run(
+            store,
+            source,
+            clock,
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            digest_options=DigestOptions(
+                timezone=ZoneInfo("Asia/Shanghai"),
+                content_mode="links_only",
+                attention=AttentionSettings(enabled=True),
+                allowed_hosts=frozenset({"fixture.test"}),
+            ),
+        )
+
+        assert summary.batch_id is not None
+        assert source.comment_calls == []
+        assert len(notifier.digests) == 1
+        assert "深圳团队" not in notifier.digests[0].content
+        assert "不应请求回复接口" not in notifier.digests[0].content
+    finally:
+        store.close()
+
+
+def test_comment_failure_keeps_posts_pending_and_retries_without_new_posts() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store)
+        clock = FakeClock(datetime(2026, 9, 5, tzinfo=UTC))
+        focused = make_post(101, "深圳团队招聘 coding agent 实习生")
+        attention_options = DigestOptions(
+            timezone=ZoneInfo("Asia/Shanghai"),
+            attention=AttentionSettings(enabled=True),
+            max_message_chars=20_000,
+            allowed_hosts=frozenset({"fixture.test"}),
+        )
+        failed_source = SequenceSource(
+            [Page([focused], exhausted=True)],
+            comments_by_post={"101": SourceError(ErrorKind.TEMPORARY_NOT_SENT, "回复接口暂不可用")},
+        )
+        failed = run(
+            store,
+            failed_source,
+            clock,
+            notifier=RecordingNotifier(),
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            retry_wait_seconds=0,
+            digest_options=attention_options,
+        )
+        assert failed.error_kind == ErrorKind.TEMPORARY_NOT_SENT
+        assert store.pending_notification_count() == 1
+        assert store.outbox_counts() == {}
+        assert store.baseline() == (True, "101")
+
+        clock.advance(1800)
+        recovered_source = SequenceSource(
+            [Page([focused], exhausted=True)],
+            comments_by_post={"101": (make_comment(1, 101, "恢复后的完整回复"),)},
+        )
+        notifier = RecordingNotifier()
+        recovered = run(
+            store,
+            recovered_source,
+            clock,
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            digest_options=attention_options,
+        )
+        assert recovered.new_count == 0
+        assert recovered.batch_id is not None
+        assert "恢复后的完整回复" in notifier.digests[0].content
+        assert store.pending_notification_count() == 0
+    finally:
+        store.close()
+
+
+def test_comment_total_change_during_pagination_defers_complete_notification() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store)
+        focused = make_post(101, "深圳团队招聘 coding agent 实习生")
+        source = ChangingCommentTotalSource(
+            [Page([focused], exhausted=True)],
+            [
+                CommentPage(
+                    comments=[make_comment(1, 101, "第一页回复")],
+                    next_page="2",
+                    exhausted=False,
+                    total=3,
+                ),
+                CommentPage(
+                    comments=[make_comment(2, 101, "第二页回复")],
+                    exhausted=True,
+                    total=2,
+                ),
+            ],
+        )
+        notifier = RecordingNotifier()
+        summary = run(
+            store,
+            source,
+            FakeClock(datetime(2026, 9, 5, tzinfo=UTC)),
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            comment_page_size=1,
+            digest_options=DigestOptions(
+                timezone=ZoneInfo("Asia/Shanghai"),
+                attention=AttentionSettings(enabled=True),
+                max_message_chars=20_000,
+                allowed_hosts=frozenset({"fixture.test"}),
+            ),
+        )
+
+        assert summary.error_kind == ErrorKind.TEMPORARY
+        assert summary.batch_id is None
+        assert notifier.digests == []
+        assert store.pending_notification_count() == 1
+    finally:
+        store.close()
 
 
 def test_current_batch_is_sent_first_and_same_run_drains_due_backlog() -> None:
@@ -714,6 +970,34 @@ def test_cleanup_retains_unbounded_above_watermark_ids() -> None:
         store.cleanup(now=now, post_retention=timedelta(days=7), audit_retention=timedelta(days=30))
         assert store.known_post_ids(["90"]) == set()
         assert store.known_post_ids(["110"]) == {"110"}
+    finally:
+        store.close()
+
+
+def test_cleanup_never_removes_accumulated_pending_notification_content() -> None:
+    store = Store(":memory:")
+    try:
+        seed_watermark(store, "100")
+        created = datetime(2026, 9, 5, tzinfo=UTC)
+        pending = make_post(101, "需要跨轮保留的完整正文")
+        store.commit_collection(
+            now=created,
+            posts=[pending],
+            matched_ids={pending.id},
+            digest=None,
+            coverage=Coverage.BOUNDED,
+            proposed_watermark="101",
+        )
+
+        store.cleanup(
+            now=created + timedelta(days=40),
+            post_retention=timedelta(days=7),
+            audit_retention=timedelta(days=30),
+        )
+
+        retained = store.pending_notification_posts()
+        assert len(retained) == 1
+        assert retained[0].text == "需要跨轮保留的完整正文"
     finally:
         store.close()
 

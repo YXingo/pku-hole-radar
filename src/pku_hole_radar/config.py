@@ -89,6 +89,7 @@ class NotifySettings:
     max_items: int
     snippet_chars: int
     max_message_chars: int
+    push_when_post_count_exceeds: int
     max_send_attempts_per_day: int
     pending_ttl_hours: float
     send_spacing_seconds: float
@@ -247,6 +248,10 @@ def load_config(path: str | Path) -> AppConfig:
         max_items=_nonnegative_int(notify_raw, "max_items", 20),
         snippet_chars=_positive_int(notify_raw, "snippet_chars", 120),
         max_message_chars=_positive_int(notify_raw, "max_message_chars", 6000),
+        # 0 保持旧行为：有匹配新帖就推送；100 表示累计到 101 条时推送。
+        push_when_post_count_exceeds=_nonnegative_int(
+            notify_raw, "push_when_post_count_exceeds", 0
+        ),
         max_send_attempts_per_day=_positive_int(notify_raw, "max_send_attempts_per_day", 60),
         pending_ttl_hours=_positive_float(notify_raw, "pending_ttl_hours", 24),
         send_spacing_seconds=_nonnegative_float(notify_raw, "send_spacing_seconds", 13),

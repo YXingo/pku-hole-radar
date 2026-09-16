@@ -3,13 +3,14 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 from .attention import AttentionCategory, AttentionMatch, AttentionSettings, rank_posts
-from .models import Coverage, Digest, Post
+from .models import Comment, Coverage, Digest, Post
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +45,11 @@ def build_digest(
         ranked = rank_posts(ordered, options.attention, excerpt_chars=options.snippet_chars)
         ordered = [post for post, _match in ranked]
         attention_matches = {post.id: match for post, match in ranked}
-        title = _attention_title(
-            ranked,
-            total=total,
-            options=options,
+        attention_enabled = any(match.relevant for _post, match in ranked)
+        title = (
+            _attention_title(ranked, total=total, options=options)
+            if attention_enabled
+            else f"树洞雷达｜{total} 条新帖"
         )
     else:
         title = f"树洞雷达｜{total} 条新帖"
@@ -97,6 +99,215 @@ def build_digest(
         post_count=total,
         shown_count=selected_count,
     )
+
+
+def build_notification_digests(
+    posts: Sequence[Post],
+    *,
+    comments_by_post: Mapping[str, Sequence[Comment]],
+    coverage: Coverage,
+    created_at: datetime,
+    options: DigestOptions,
+) -> tuple[Digest, ...]:
+    """构造可投递通知；关注帖全文与全部可见回复不因单条渠道上限而截断。"""
+
+    ordered = sorted(_dedupe(tuple(posts)), key=lambda post: int(post.id), reverse=True)
+    settings = options.attention
+    if options.content_mode == "links_only" or settings is None or not settings.enabled:
+        return (build_digest(ordered, coverage=coverage, created_at=created_at, options=options),)
+
+    ranked = rank_posts(ordered, settings, excerpt_chars=options.snippet_chars)
+    focused = [(post, match) for post, match in ranked if match.relevant]
+    if not focused:
+        return (build_digest(ordered, coverage=coverage, created_at=created_at, options=options),)
+
+    missing = [post.id for post, _match in focused if post.id not in comments_by_post]
+    if missing:
+        raise ValueError("关注帖缺少完整回复结果")
+
+    total = len(ordered)
+    title = _attention_title(ranked, total=total, options=options)
+    blocks = [
+        _header(ordered, coverage, options.timezone),
+        _attention_overview(ranked, total=total),
+        "【优先关注｜原帖与回复全文】",
+    ]
+    for index, (post, match) in enumerate(focused, 1):
+        blocks.append(
+            _render_full_attention_post(
+                post,
+                match,
+                comments=comments_by_post[post.id],
+                index=index,
+                focused_count=len(focused),
+                options=options,
+            )
+        )
+
+    ordinary = [(post, match) for post, match in ranked if not match.relevant]
+    if options.max_items == 0:
+        shown_ordinary = ordinary
+    else:
+        shown_ordinary = ordinary[: max(0, options.max_items - len(focused))]
+    if shown_ordinary:
+        blocks.append("【其他新帖】")
+        blocks.extend(_render_ordinary_post(post, options) for post, _match in shown_ordinary)
+    shown_count = len(focused) + len(shown_ordinary)
+    blocks.append(
+        f"本批累计共 {total} 条，关注 {len(focused)} 条，展示 {shown_count} 条，"
+        f"另 {total - shown_count} 条未展开"
+    )
+    content = "\n\n".join(blocks)
+    return _multipart_digests(
+        title=title,
+        content=content,
+        posts=ordered,
+        coverage=coverage,
+        created_at=created_at,
+        shown_count=shown_count,
+        max_message_chars=options.max_message_chars,
+    )
+
+
+def _render_full_attention_post(
+    post: Post,
+    match: AttentionMatch,
+    *,
+    comments: Sequence[Comment],
+    index: int,
+    focused_count: int,
+    options: DigestOptions,
+) -> str:
+    lines = [
+        f"━━ 关注帖 {index}/{focused_count}｜{match.category.value} ━━",
+        f"#{post.id}｜{post.created_at.astimezone(options.timezone):%Y-%m-%d %H:%M:%S}",
+    ]
+    details = []
+    if match.direction:
+        details.append(f"方向：{match.direction}")
+    if match.location:
+        details.append(f"地点：{match.location}")
+    if details:
+        lines.append("｜".join(details))
+    if match.matched_keywords:
+        lines.append("命中词：" + "、".join(match.matched_keywords))
+    lines.extend(
+        (
+            "原帖全文：",
+            _full_text(post.text, has_media=post.has_media, empty_label="无文字原帖"),
+            f"原帖链接：{canonical_url(post, options)}",
+        )
+    )
+
+    ordered_comments = sorted(
+        comments,
+        key=lambda comment: (comment.created_at, int(comment.id)),
+    )
+    lines.append(f"回复（{len(ordered_comments)} 条，已完整获取当前公开可见回复）：")
+    if not ordered_comments:
+        lines.append("暂无公开回复")
+    for floor, comment in enumerate(ordered_comments, 1):
+        label = "｜洞主" if comment.is_author else ""
+        quote_label = f"｜回复 C{comment.quote_id}" if comment.quote_id else ""
+        lines.append(
+            f"— {floor} 楼｜C{comment.id}｜"
+            f"{comment.created_at.astimezone(options.timezone):%m-%d %H:%M:%S}"
+            f"{label}{quote_label} —"
+        )
+        lines.append(
+            _full_text(comment.text, has_media=comment.has_media, empty_label="无文字回复")
+        )
+    return "\n".join(lines)
+
+
+def _render_ordinary_post(post: Post, options: DigestOptions) -> str:
+    line = f"#{post.id}｜{post.created_at.astimezone(options.timezone):%m-%d %H:%M}"
+    snippet = compact_text(post.text, has_media=post.has_media, limit=options.snippet_chars)
+    if snippet:
+        line += f"｜{snippet}"
+    return f"{line}\n{canonical_url(post, options)}"
+
+
+def _full_text(text: str, *, has_media: bool, empty_label: str) -> str:
+    clean = "".join(ch for ch in text if unicodedata.category(ch) != "Cc" or ch in "\n\t")
+    clean = clean.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if clean:
+        if has_media:
+            return clean + "\n[含图片，图片请在原帖中查看]"
+        return clean
+    if has_media:
+        return f"[{empty_label}；含图片，请在原帖中查看]"
+    return f"[{empty_label}]"
+
+
+def _multipart_digests(
+    *,
+    title: str,
+    content: str,
+    posts: Sequence[Post],
+    coverage: Coverage,
+    created_at: datetime,
+    shown_count: int,
+    max_message_chars: int,
+) -> tuple[Digest, ...]:
+    group_id = uuid.uuid4().hex
+    if len(title) + len(content) <= max_message_chars:
+        return (
+            Digest(
+                batch_id=group_id,
+                group_id=group_id,
+                title=title,
+                content=content,
+                post_ids=tuple(post.id for post in posts),
+                created_at=created_at,
+                coverage=coverage,
+                post_count=len(posts),
+                shown_count=shown_count,
+            ),
+        )
+
+    # 为标题分片后缀和正文分片标记预留固定空间；正文按换行优先切分且不丢字符。
+    chunk_limit = max_message_chars - len(title) - 48
+    if chunk_limit < 80:
+        raise ValueError("max_message_chars 太小，无法承载关注帖完整内容分片")
+    chunks = _split_complete_text(content, chunk_limit)
+    part_count = len(chunks)
+    digests: list[Digest] = []
+    for index, chunk in enumerate(chunks, 1):
+        part_title = f"{title}（{index}/{part_count}）"
+        part_content = f"第 {index}/{part_count} 部分\n{chunk}"
+        if len(part_title) + len(part_content) > max_message_chars:
+            raise ValueError("关注帖通知分片仍超过消息长度上限")
+        digests.append(
+            Digest(
+                batch_id=f"{group_id}-{index:04d}",
+                group_id=group_id,
+                part_index=index,
+                part_count=part_count,
+                title=part_title,
+                content=part_content,
+                post_ids=tuple(post.id for post in posts) if index == 1 else (),
+                created_at=created_at,
+                coverage=coverage,
+                post_count=len(posts),
+                shown_count=shown_count if index == 1 else 0,
+            )
+        )
+    return tuple(digests)
+
+
+def _split_complete_text(text: str, limit: int) -> tuple[str, ...]:
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + limit)
+        if end < len(text):
+            newline = text.rfind("\n", start + limit // 2, end)
+            if newline > start:
+                end = newline + 1
+        chunks.append(text[start:end])
+        start = end
+    return tuple(chunks)
 
 
 def compact_text(text: str, *, has_media: bool = False, limit: int = 120) -> str:

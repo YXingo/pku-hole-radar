@@ -13,8 +13,8 @@ from pku_hole_radar.attention import (
     rank_posts,
 )
 from pku_hole_radar.config import ConfigError, load_config
-from pku_hole_radar.digest import DigestOptions, build_digest
-from pku_hole_radar.models import Coverage, Post, SendResult, SendState
+from pku_hole_radar.digest import DigestOptions, build_digest, build_notification_digests
+from pku_hole_radar.models import Comment, Coverage, Post, SendResult, SendState
 from pku_hole_radar.store import Store
 
 
@@ -34,6 +34,16 @@ def settings(**overrides: object) -> AttentionSettings:
     }
     values.update(overrides)
     return AttentionSettings(**values)  # type: ignore[arg-type]
+
+
+def comment(comment_id: int, post_id: int, text: str, *, author: bool = False) -> Comment:
+    return Comment(
+        id=str(comment_id),
+        post_id=str(post_id),
+        created_at=datetime(2026, 9, 5, 1, comment_id, tzinfo=UTC),
+        text=text,
+        is_author=author,
+    )
 
 
 def test_attention_classifies_recruitment_help_and_closed_posts() -> None:
@@ -165,7 +175,68 @@ def test_attention_title_includes_a_short_excerpt_only_for_one_category() -> Non
             allowed_hosts=frozenset({"fixture.test"}),
         ),
     )
-    assert no_match.title == "树洞雷达｜1帖·关注0"
+    assert no_match.title == "树洞雷达｜1 条新帖"
+
+
+def test_attention_notification_prioritizes_full_post_and_all_comments() -> None:
+    focused = post(1, "深圳团队招聘 coding agent 实习生。\n第二段完整要求。")
+    ordinary = post(2, "普通树洞正文")
+    parts = build_notification_digests(
+        [ordinary, focused],
+        comments_by_post={
+            "1": (
+                comment(11, 1, "第一条完整回复", author=True),
+                comment(12, 1, "第二条完整回复"),
+            )
+        },
+        coverage=Coverage.BOUNDED,
+        created_at=datetime(2026, 9, 5, tzinfo=UTC),
+        options=DigestOptions(
+            timezone=ZoneInfo("Asia/Shanghai"),
+            attention=settings(),
+            max_items=0,
+            max_message_chars=20_000,
+            allowed_hosts=frozenset({"fixture.test"}),
+        ),
+    )
+
+    assert len(parts) == 1
+    content = parts[0].content
+    assert content.index("【优先关注") < content.index("【其他新帖】")
+    assert "深圳团队招聘 coding agent 实习生。\n第二段完整要求。" in content
+    assert "回复（2 条，已完整获取当前公开可见回复）" in content
+    assert "第一条完整回复" in content
+    assert "第二条完整回复" in content
+    assert "｜洞主" in content
+    assert "普通树洞正文" in content
+
+
+def test_attention_notification_splits_without_dropping_full_comment_text() -> None:
+    focused = post(1, "深圳团队招聘 coding agent 实习生")
+    full_reply = "𠮷" * 1_200 + "回复结束"
+    parts = build_notification_digests(
+        [focused],
+        comments_by_post={"1": (comment(11, 1, full_reply),)},
+        coverage=Coverage.BOUNDED,
+        created_at=datetime(2026, 9, 5, tzinfo=UTC),
+        options=DigestOptions(
+            timezone=ZoneInfo("Asia/Shanghai"),
+            attention=settings(),
+            max_items=0,
+            max_message_chars=500,
+            allowed_hosts=frozenset({"fixture.test"}),
+        ),
+    )
+
+    assert len(parts) > 1
+    assert {part.group_id for part in parts} == {parts[0].group_id}
+    assert [part.part_index for part in parts] == list(range(1, len(parts) + 1))
+    assert all(part.part_count == len(parts) for part in parts)
+    assert parts[0].post_ids == ("1",)
+    assert all(not part.post_ids for part in parts[1:])
+    assert all(len(part.title) + len(part.content) <= 500 for part in parts)
+    assert sum(part.content.count("𠮷") for part in parts) == 1_200
+    assert any("回复结束" in part.content for part in parts)
 
 
 def test_attention_outbox_retry_reuses_saved_title_and_content() -> None:

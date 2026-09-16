@@ -51,6 +51,8 @@ content_mode = "snippet"
 max_items = 20
 snippet_chars = 120
 max_message_chars = 6000
+# 0 保持“有新帖即推送”；设为 100 则累计到 101 条，或命中关注主题时推送。
+push_when_post_count_exceeds = 0
 max_send_attempts_per_day = 200
 pending_ttl_hours = 24
 # 同一轮清理积压时，两次 PushPlus 请求至少间隔 13 秒，低于每分钟 5 次的限制。

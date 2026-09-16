@@ -60,11 +60,41 @@ class Post:
 
 
 @dataclass(frozen=True, slots=True)
+class Comment:
+    id: str
+    post_id: str
+    created_at: datetime
+    text: str
+    is_author: bool = False
+    has_media: bool = False
+    quote_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.id.isascii() or not self.id.isdecimal():
+            raise ValueError("回复 ID 必须是非空十进制字符串")
+        if not self.post_id or not self.post_id.isascii() or not self.post_id.isdecimal():
+            raise ValueError("回复所属帖子 ID 必须是非空十进制字符串")
+        if self.quote_id is not None and (
+            not self.quote_id or not self.quote_id.isascii() or not self.quote_id.isdecimal()
+        ):
+            raise ValueError("被引用回复 ID 必须是十进制字符串")
+        object.__setattr__(self, "created_at", ensure_utc(self.created_at))
+
+
+@dataclass(frozen=True, slots=True)
 class Page:
     posts: list[Post]
     next_page: str | None = None
     exhausted: bool = False
     total: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CommentPage:
+    comments: list[Comment]
+    next_page: str | None = None
+    exhausted: bool = False
+    total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +107,17 @@ class Digest:
     coverage: Coverage
     post_count: int
     shown_count: int
+    group_id: str = ""
+    part_index: int = 1
+    part_count: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.batch_id:
+            raise ValueError("通知批次 ID 不能为空")
+        if not self.group_id:
+            object.__setattr__(self, "group_id", self.batch_id)
+        if self.part_index <= 0 or self.part_count <= 0 or self.part_index > self.part_count:
+            raise ValueError("通知分片序号无效")
 
 
 @dataclass(frozen=True, slots=True)

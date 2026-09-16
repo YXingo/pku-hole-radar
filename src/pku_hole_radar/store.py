@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .models import Coverage, Digest, ErrorKind, Post, SendClaim, SendResult, SendState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StoreError(RuntimeError):
@@ -140,13 +140,17 @@ class Store:
         now: datetime,
         posts: Sequence[Post],
         matched_ids: set[str],
-        digest: Digest | None,
+        digest: Digest | None = None,
+        digests: Sequence[Digest] = (),
         coverage: Coverage,
         proposed_watermark: str | None,
         baseline: bool = False,
     ) -> CollectionCommit:
         """原子提交帖子、批次关联和水位；调用方不得在事务外推进水位。"""
 
+        if digest is not None and digests:
+            raise StoreError("不能同时提交 digest 和 digests")
+        notification_parts = tuple(digests) if digests else ((digest,) if digest else ())
         now_text = _iso(now)
         post_ids = tuple(dict.fromkeys(post.id for post in posts))
         if len(post_ids) != len(posts):
@@ -168,50 +172,87 @@ class Store:
                 connection.execute(
                     """
                     INSERT INTO posts
-                    (id, created_at, first_seen_at, snippet, url, matched, batch_id)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    (id, created_at, first_seen_at, snippet, body, has_media, url, matched,
+                     notify_pending, batch_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         post.id,
                         _iso(post.created_at),
                         now_text,
                         _stored_snippet(post.text, post.has_media),
+                        post.text,
+                        1 if post.has_media else 0,
                         post.url,
                         1 if post.id in matched_ids else 0,
+                        1 if post.id in matched_ids and not baseline else 0,
                     ),
                 )
                 inserted_ids.append(post.id)
 
             batch_id = None
-            if digest is not None:
-                new_matched = [post_id for post_id in digest.post_ids if post_id in inserted_ids]
-                if set(new_matched) != set(digest.post_ids):
-                    raise StoreError("digest 包含已入库帖子，拒绝重新分配通知批次")
-                batch_id = digest.batch_id
-                connection.execute(
-                    """
-                    INSERT INTO outbox
-                    (batch_id, title, content, post_count, shown_count, status, attempts,
-                     next_attempt_at, provider_receipt, created_at, updated_at, last_error_kind)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, NULL)
-                    """,
-                    (
-                        digest.batch_id,
-                        digest.title,
-                        digest.content,
-                        digest.post_count,
-                        digest.shown_count,
-                        SendState.PENDING.value,
-                        now_text,
-                        now_text,
-                        now_text,
-                    ),
-                )
-                for post_id in digest.post_ids:
-                    connection.execute(
-                        "UPDATE posts SET batch_id = ? WHERE id = ? AND batch_id IS NULL",
-                        (digest.batch_id, post_id),
+            if notification_parts:
+                batch_ids = [part.batch_id for part in notification_parts]
+                if len(set(batch_ids)) != len(batch_ids):
+                    raise StoreError("通知分片包含重复批次 ID")
+                group_ids = {part.group_id for part in notification_parts}
+                part_indexes = {part.part_index for part in notification_parts}
+                expected_indexes = set(range(1, len(notification_parts) + 1))
+                if (
+                    len(group_ids) != 1
+                    or any(
+                        part.part_count != len(notification_parts) for part in notification_parts
                     )
+                    or part_indexes != expected_indexes
+                ):
+                    raise StoreError("通知分片的组标识或序号不一致")
+
+                assigned_ids = [post_id for part in notification_parts for post_id in part.post_ids]
+                if len(set(assigned_ids)) != len(assigned_ids):
+                    raise StoreError("同一帖子不能分配给多个通知分片")
+                pending_rows = connection.execute(
+                    "SELECT id FROM posts WHERE notify_pending = 1 ORDER BY id"
+                ).fetchall()
+                pending_ids = {str(row["id"]) for row in pending_rows}
+                if set(assigned_ids) != pending_ids:
+                    raise StoreError("通知分片必须完整覆盖当前累计待通知帖子")
+
+                for part in sorted(notification_parts, key=lambda item: item.part_index):
+                    connection.execute(
+                        """
+                        INSERT INTO outbox
+                        (batch_id, group_id, part_index, part_count, title, content, post_count,
+                         shown_count, status, attempts, next_attempt_at, provider_receipt,
+                         created_at, updated_at, last_error_kind)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, NULL)
+                        """,
+                        (
+                            part.batch_id,
+                            part.group_id,
+                            part.part_index,
+                            part.part_count,
+                            part.title,
+                            part.content,
+                            part.post_count,
+                            part.shown_count,
+                            SendState.PENDING.value,
+                            now_text,
+                            now_text,
+                            now_text,
+                        ),
+                    )
+                    for post_id in part.post_ids:
+                        cursor = connection.execute(
+                            """
+                            UPDATE posts
+                            SET batch_id = ?, notify_pending = 0
+                            WHERE id = ? AND batch_id IS NULL AND notify_pending = 1
+                            """,
+                            (part.batch_id, post_id),
+                        )
+                        if cursor.rowcount != 1:
+                            raise StoreError("待通知帖子在事务中发生变化")
+                batch_id = min(notification_parts, key=lambda item: item.part_index).batch_id
 
             if baseline:
                 _set_state(connection, "baseline_initialized", "1")
@@ -285,17 +326,25 @@ class Store:
             if attempts_today >= daily_limit:
                 return ClaimDecision(None, "daily_send_budget_exhausted")
 
+            preferred_group_id = None
+            if preferred_batch_id:
+                preferred = connection.execute(
+                    "SELECT group_id FROM outbox WHERE batch_id = ?", (preferred_batch_id,)
+                ).fetchone()
+                if preferred is not None:
+                    preferred_group_id = str(preferred["group_id"])
+
             row = connection.execute(
                 """
                 SELECT batch_id, title, content, attempts, created_at
                 FROM outbox
                 WHERE status = ? AND (attempts < ? OR last_error_kind = 'manual_retry_acknowledged')
                   AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
-                ORDER BY CASE WHEN batch_id = ? THEN 0 ELSE 1 END,
-                         next_attempt_at ASC, created_at ASC
+                ORDER BY CASE WHEN group_id = ? THEN 0 ELSE 1 END,
+                         next_attempt_at ASC, created_at ASC, group_id ASC, part_index ASC
                 LIMIT 1
                 """,
-                (SendState.PENDING.value, max_attempts, now_text, preferred_batch_id),
+                (SendState.PENDING.value, max_attempts, now_text, preferred_group_id),
             ).fetchone()
             if row is None:
                 return ClaimDecision(None, "no_due_outbox")
@@ -488,14 +537,17 @@ class Store:
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO posts
-                    (id, created_at, first_seen_at, snippet, url, matched, batch_id)
-                    VALUES (?, ?, ?, ?, ?, 0, NULL)
+                    (id, created_at, first_seen_at, snippet, body, has_media, url, matched,
+                     notify_pending, batch_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL)
                     """,
                     (
                         post.id,
                         _iso(post.created_at),
                         now_text,
                         _stored_snippet(post.text, post.has_media),
+                        post.text,
+                        1 if post.has_media else 0,
                         post.url,
                     ),
                 )
@@ -511,11 +563,41 @@ class Store:
     def posts_for_batch(self, batch_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            SELECT id, created_at, first_seen_at, snippet, url, matched, batch_id
+            SELECT id, created_at, first_seen_at, snippet, body, has_media, url, matched,
+                   notify_pending, batch_id
             FROM posts WHERE batch_id = ? ORDER BY CAST(id AS INTEGER) DESC
             """,
             (batch_id,),
         ).fetchall()
+
+    def pending_notification_posts(self) -> list[Post]:
+        rows = self.connection.execute(
+            """
+            SELECT id, created_at, body, url, has_media
+            FROM posts
+            WHERE notify_pending = 1 AND matched = 1 AND batch_id IS NULL
+            ORDER BY CAST(id AS INTEGER) DESC
+            """
+        ).fetchall()
+        return [
+            Post(
+                id=str(row["id"]),
+                created_at=_parse_iso(str(row["created_at"])),
+                text=str(row["body"]),
+                url=str(row["url"]),
+                has_media=bool(row["has_media"]),
+            )
+            for row in rows
+        ]
+
+    def pending_notification_count(self) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM posts
+            WHERE notify_pending = 1 AND matched = 1 AND batch_id IS NULL
+            """
+        ).fetchone()
+        return int(row["count"])
 
     def outbox(self, batch_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -573,18 +655,19 @@ class Store:
             )
             content_cleared = content_cursor.rowcount
 
-            # 终态帖子 7 天后可以清空片段，但不能把未决批次的正文清掉。
+            # 终态帖子 7 天后可以清空正文；累计待通知和未决批次的内容不能清掉。
             snippet_cursor = connection.execute(
                 """
-                UPDATE posts SET snippet = ''
+                UPDATE posts SET snippet = '', body = ''
                 WHERE rowid IN (
                     SELECT p.rowid
                     FROM posts AS p
                     LEFT JOIN outbox AS o ON o.batch_id = p.batch_id
                     WHERE p.first_seen_at < ?
+                      AND p.notify_pending = 0
                       AND (p.batch_id IS NULL
                            OR o.status IN ('accepted', 'delivered', 'expired', 'discarded'))
-                      AND p.snippet != ''
+                      AND (p.snippet != '' OR p.body != '')
                     ORDER BY p.first_seen_at ASC
                     LIMIT ?
                 )
@@ -624,6 +707,7 @@ class Store:
                         FROM posts AS p
                         LEFT JOIN outbox AS o ON o.batch_id = p.batch_id
                         WHERE p.first_seen_at < ?
+                          AND p.notify_pending = 0
                           AND (p.batch_id IS NULL
                                OR o.status IN ('accepted', 'delivered', 'expired', 'discarded'))
                           AND CAST(p.id AS INTEGER) <= CAST(? AS INTEGER)
@@ -702,6 +786,33 @@ class Store:
         ).fetchone()
         return None if row is None else SendState(str(row["status"]))
 
+    def notification_group_status(self, batch_id: str) -> SendState | None:
+        group = self.connection.execute(
+            "SELECT group_id FROM outbox WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if group is None:
+            return None
+        rows = self.connection.execute(
+            "SELECT status FROM outbox WHERE group_id = ?",
+            (group["group_id"],),
+        ).fetchall()
+        states = {SendState(str(row["status"])) for row in rows}
+        for state in (
+            SendState.UNKNOWN,
+            SendState.FAILED,
+            SendState.SENDING,
+            SendState.PENDING,
+            SendState.EXPIRED,
+            SendState.DISCARDED,
+        ):
+            if state in states:
+                return state
+        if SendState.ACCEPTED in states:
+            return SendState.ACCEPTED
+        if SendState.DELIVERED in states:
+            return SendState.DELIVERED
+        return None
+
     def due_outbox_count(self, now: datetime) -> int:
         row = self.connection.execute(
             """
@@ -761,6 +872,46 @@ class Store:
             raise StoreError(f"数据库版本 {version} 高于程序支持的 {SCHEMA_VERSION}")
         if version == 0:
             self._create_schema()
+        elif version == 1:
+            self._migrate_v1_to_v2()
+
+    def _migrate_v1_to_v2(self) -> None:
+        """旧数据都视为已经完成过通知决策，避免升级后误发历史帖子。"""
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("ALTER TABLE posts ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+            self.connection.execute(
+                "ALTER TABLE posts ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (has_media IN (0, 1))"
+            )
+            self.connection.execute(
+                "ALTER TABLE posts ADD COLUMN notify_pending INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (notify_pending IN (0, 1))"
+            )
+            self.connection.execute("UPDATE posts SET body = snippet")
+            self.connection.execute(
+                "ALTER TABLE outbox ADD COLUMN group_id TEXT NOT NULL DEFAULT ''"
+            )
+            self.connection.execute(
+                "ALTER TABLE outbox ADD COLUMN part_index INTEGER NOT NULL DEFAULT 1"
+            )
+            self.connection.execute(
+                "ALTER TABLE outbox ADD COLUMN part_count INTEGER NOT NULL DEFAULT 1"
+            )
+            self.connection.execute("UPDATE outbox SET group_id = batch_id")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_posts_notify_pending "
+                "ON posts(notify_pending, matched, batch_id)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outbox_group_part ON outbox(group_id, part_index)"
+            )
+            self.connection.execute("PRAGMA user_version = 2")
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def _create_schema(self) -> None:
         """使用显式短事务创建初始 schema，避免 executescript 隐式提交外层事务。"""
@@ -779,6 +930,9 @@ class Store:
                 """
                 CREATE TABLE IF NOT EXISTS outbox (
                     batch_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    part_index INTEGER NOT NULL DEFAULT 1 CHECK (part_index > 0),
+                    part_count INTEGER NOT NULL DEFAULT 1 CHECK (part_count > 0),
                     title TEXT NOT NULL,
                     content TEXT,
                     post_count INTEGER NOT NULL CHECK (post_count >= 0),
@@ -800,8 +954,11 @@ class Store:
                     created_at TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
                     snippet TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    has_media INTEGER NOT NULL DEFAULT 0 CHECK (has_media IN (0, 1)),
                     url TEXT NOT NULL,
                     matched INTEGER NOT NULL CHECK (matched IN (0, 1)),
+                    notify_pending INTEGER NOT NULL DEFAULT 0 CHECK (notify_pending IN (0, 1)),
                     batch_id TEXT REFERENCES outbox(batch_id)
                 )
                 """
@@ -824,6 +981,10 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_posts_batch_id ON posts(batch_id)"
             )
             self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_posts_notify_pending "
+                "ON posts(notify_pending, matched, batch_id)"
+            )
+            self.connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_outbox_due
                 ON outbox(status, next_attempt_at, created_at)
@@ -835,7 +996,10 @@ class Store:
                 ON send_attempts(started_at)
                 """
             )
-            self.connection.execute("PRAGMA user_version = 1")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outbox_group_part ON outbox(group_id, part_index)"
+            )
+            self.connection.execute("PRAGMA user_version = 2")
             self.connection.commit()
         except BaseException:
             self.connection.rollback()

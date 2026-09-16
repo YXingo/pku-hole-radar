@@ -10,9 +10,22 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from .digest import DigestOptions, build_digest
+from .attention import rank_posts
+from .digest import DigestOptions, build_notification_digests
 from .filtering import KeywordFilter
-from .models import Coverage, ErrorKind, FetchSummary, Page, Post, RunSummary, SendResult, SendState
+from .models import (
+    Comment,
+    CommentPage,
+    Coverage,
+    Digest,
+    ErrorKind,
+    FetchSummary,
+    Page,
+    Post,
+    RunSummary,
+    SendResult,
+    SendState,
+)
 from .notifier import Notifier
 from .source import Source, SourceError
 from .store import ClaimDecision, Store, StoreError
@@ -98,7 +111,15 @@ class RunnerSettings:
     send_retry_spacing_seconds: float = 1800
     cleanup_interval_seconds: float = 86400
     cleanup_batch_size: int = 500
+    push_when_post_count_exceeds: int = 0
+    comment_page_size: int = 50
     digest_options: DigestOptions | None = None
+
+    def __post_init__(self) -> None:
+        if self.push_when_post_count_exceeds < 0:
+            raise ValueError("push_when_post_count_exceeds 不能为负数")
+        if self.comment_page_size <= 0:
+            raise ValueError("comment_page_size 必须为正数")
 
 
 @dataclass(slots=True)
@@ -147,7 +168,8 @@ class Runner:
         self.send = send
         self.allow_empty_baseline = allow_empty_baseline
         self.last_fetch: FetchSummary | None = None
-        self.last_digest = None
+        self.last_digest: Digest | None = None
+        self.last_digests: tuple[Digest, ...] = ()
 
     def run_once(self) -> RunSummary:
         run_id = uuid.uuid4().hex
@@ -210,56 +232,53 @@ class Runner:
             }
         )
         fetch = self._collect(budget)
-        if self._budget_expired(budget):
+        collection_safe = not self._budget_expired(budget)
+        if not collection_safe:
             fetch = self._budget_exceeded_fetch(fetch)
-        digest_error = False
-        digest = None
-        if not self._budget_expired(budget):
-            try:
-                digest = self._digest_for(fetch, started_at)
-            except (TypeError, ValueError):
-                # 链接模板或长度配置异常时，宁可不入库也不把候选标成已处理；否则
-                # 修复配置后会因去重记录而永久跳过这批帖子。
-                fetch = FetchSummary(
-                    posts=fetch.posts,
-                    candidate_posts=fetch.candidate_posts,
-                    coverage=Coverage.INCOMPLETE,
-                    request_count=fetch.request_count,
-                    pages=fetch.pages,
-                    proposed_watermark=None,
-                    error_kind=ErrorKind.CONTRACT,
-                    error_message="简报无法安全构造，未推进水位",
-                    baseline=False,
-                )
-                digest = None
-                digest_error = True
-        self.last_fetch = fetch
-        self.last_digest = digest
-
         matched_ids: set[str] = set()
-        if not self._budget_expired(budget):
+        if collection_safe:
             matched_ids = {
                 post.id
                 for post in fetch.candidate_posts
                 if not post.is_pinned and self.keyword_filter.matches(post.text)
             }
-        if self._budget_expired(budget):
-            fetch = self._budget_exceeded_fetch(fetch)
-            digest = None
-            digest_error = True
+
+        notification_parts: tuple[Digest, ...] = ()
+        notification_error: SourceError | None = None
+        if collection_safe and not fetch.baseline:
+            try:
+                notification_parts = self._notification_for(
+                    fetch,
+                    matched_ids=matched_ids,
+                    created_at=started_at,
+                    budget=budget,
+                )
+            except SourceError as exc:
+                # 采集结果仍可安全持久化为累计待通知；下一轮会重新尝试获取完整回复。
+                notification_error = exc
+            except (TypeError, ValueError):
+                notification_error = SourceError(
+                    ErrorKind.CONTRACT,
+                    "通知内容无法安全构造，帖子已保留为累计待通知",
+                )
+
+        if collection_safe:
+            fetch = replace(fetch, request_count=budget.request_count)
+        self.last_fetch = fetch
+        self.last_digests = notification_parts
+        self.last_digest = notification_parts[0] if notification_parts else None
 
         try:
             if (
                 self.commit
-                and not digest_error
-                and not self._budget_expired(budget)
+                and collection_safe
                 and (fetch.baseline or fetch.candidate_posts or fetch.coverage)
             ):
                 self.store.commit_collection(
                     now=self.clock.now(),
                     posts=fetch.posts if fetch.baseline else fetch.candidate_posts,
                     matched_ids=matched_ids,
-                    digest=digest,
+                    digests=notification_parts,
                     coverage=fetch.coverage,
                     proposed_watermark=fetch.proposed_watermark,
                     baseline=fetch.baseline,
@@ -286,6 +305,22 @@ class Runner:
             )
 
         self._record_fetch(fetch, self.clock.now())
+        if notification_error is not None and self.commit:
+            self.store.set_states(
+                {
+                    "last_notification_error_kind": notification_error.kind.value,
+                    "last_notification_error_message": notification_error.message,
+                    "last_notification_error_at": _iso(self.clock.now()),
+                }
+            )
+        elif notification_parts and self.commit:
+            self.store.set_states(
+                {
+                    "last_notification_error_kind": None,
+                    "last_notification_error_message": None,
+                    "last_notification_error_at": None,
+                }
+            )
         result = self._finish_summary(
             run_id,
             started_mono,
@@ -294,9 +329,11 @@ class Runner:
             new_count=len(fetch.candidate_posts),
             matched_count=len(matched_ids),
             coverage=fetch.coverage,
-            batch_id=digest.batch_id if digest else None,
-            error_kind=fetch.error_kind,
-            error_message=fetch.error_message,
+            batch_id=notification_parts[0].batch_id if notification_parts else None,
+            error_kind=fetch.error_kind
+            or (notification_error.kind if notification_error else None),
+            error_message=fetch.error_message
+            or (notification_error.message if notification_error else None),
         )
         result = self._attach_send(result, started_mono, budget)
         return result
@@ -589,25 +626,140 @@ class Runner:
             baseline=False,
         )
 
-    def _digest_for(self, fetch: FetchSummary, created_at: datetime):
-        if fetch.baseline or not fetch.candidate_posts:
-            return None
-        matching = [
-            post
-            for post in fetch.candidate_posts
-            if not post.is_pinned and self.keyword_filter.matches(post.text)
-        ]
-        if not matching:
-            return None
+    def _notification_for(
+        self,
+        fetch: FetchSummary,
+        *,
+        matched_ids: set[str],
+        created_at: datetime,
+        budget: _Budget,
+    ) -> tuple[Digest, ...]:
+        current = [post for post in fetch.candidate_posts if post.id in matched_ids]
+        accumulated = _unique_posts([*self.store.pending_notification_posts(), *current])
+        if not accumulated:
+            return ()
+
         options = self.settings.digest_options
         if options is None:
             options = DigestOptions(timezone=self.settings.timezone)
-        return build_digest(
-            matching,
+
+        focused: list[Post] = []
+        if options.attention is not None and options.attention.enabled:
+            focused = [
+                post
+                for post, match in rank_posts(
+                    accumulated,
+                    options.attention,
+                    excerpt_chars=options.snippet_chars,
+                )
+                if match.relevant
+            ]
+        threshold_hit = len(accumulated) > self.settings.push_when_post_count_exceeds
+        if not threshold_hit and not focused:
+            return ()
+
+        comments_by_post: dict[str, tuple[Comment, ...]] = {}
+        if options.content_mode != "links_only":
+            for post in focused:
+                comments_by_post[post.id] = self._fetch_all_comments(post.id, budget)
+        return build_notification_digests(
+            accumulated,
+            comments_by_post=comments_by_post,
             coverage=fetch.coverage,
             created_at=created_at,
             options=options,
         )
+
+    def _fetch_all_comments(self, post_id: str, budget: _Budget) -> tuple[Comment, ...]:
+        comments: list[Comment] = []
+        seen_ids: set[str] = set()
+        seen_tokens: set[str | None] = set()
+        token: str | None = None
+        declared_total: int | None = None
+        while True:
+            if token in seen_tokens:
+                raise SourceError(ErrorKind.CONTRACT, "树洞回复分页 token 重复")
+            seen_tokens.add(token)
+            page = self._fetch_comment_page(post_id, token, budget)
+            if page.next_page is not None and not isinstance(page.next_page, str):
+                raise SourceError(ErrorKind.CONTRACT, "树洞回复分页 token 不是字符串")
+            if page.exhausted and page.next_page is not None:
+                raise SourceError(ErrorKind.CONTRACT, "树洞回复分页状态互相矛盾")
+            if page.total < 0:
+                raise SourceError(ErrorKind.CONTRACT, "树洞回复总数不能为负数")
+            if declared_total is None:
+                declared_total = page.total
+            elif page.total != declared_total:
+                raise SourceError(
+                    ErrorKind.TEMPORARY,
+                    "树洞回复在分页期间发生变化，已延后通知以保证内容完整",
+                )
+            for comment in page.comments:
+                if comment.post_id != post_id:
+                    raise SourceError(ErrorKind.CONTRACT, "树洞回复所属帖子与请求不一致")
+                if comment.id in seen_ids:
+                    raise SourceError(ErrorKind.CONTRACT, "树洞回复分页包含重复回复")
+                seen_ids.add(comment.id)
+                comments.append(comment)
+            if page.exhausted:
+                if len(comments) != declared_total:
+                    raise SourceError(
+                        ErrorKind.TEMPORARY,
+                        "树洞回复在分页期间发生变化，已延后通知以保证内容完整",
+                    )
+                return tuple(comments)
+            if page.next_page is None or page.next_page in seen_tokens:
+                raise SourceError(ErrorKind.CONTRACT, "树洞回复分页未提供有效下一页")
+            token = page.next_page
+
+    def _fetch_comment_page(
+        self,
+        post_id: str,
+        token: str | None,
+        budget: _Budget,
+    ) -> CommentPage:
+        last_error: SourceError | None = None
+        for attempt in range(2):
+            if self._request_budget_exhausted(budget):
+                raise SourceError(ErrorKind.TEMPORARY, "达到单轮 HTTP 请求预算")
+            self._wait_between_requests(budget)
+            if self.clock.monotonic() >= budget.deadline_mono:
+                raise SourceError(ErrorKind.TEMPORARY, "达到单轮运行时间上限")
+            budget.request_count += 1
+            budget.last_request_mono = self.clock.monotonic()
+            try:
+                remaining = budget.remaining(self.clock.monotonic())
+                bounded_fetch = getattr(self.source, "fetch_comments_with_timeout", None)
+                if callable(bounded_fetch):
+                    page = bounded_fetch(
+                        post_id,
+                        token,
+                        self.settings.comment_page_size,
+                        timeout_seconds=remaining,
+                    )
+                else:
+                    page = self.source.fetch_comments(
+                        post_id,
+                        token,
+                        self.settings.comment_page_size,
+                    )
+                if self._budget_expired(budget):
+                    raise SourceError(ErrorKind.TEMPORARY, "回复响应超过单轮运行时间上限")
+                return page
+            except SourceError as exc:
+                last_error = exc
+                retryable = exc.kind in {ErrorKind.TEMPORARY, ErrorKind.TEMPORARY_NOT_SENT}
+                if self._budget_expired(budget) or not retryable or attempt == 1:
+                    raise
+                wait = max(self.settings.retry_wait_seconds, self.settings.request_spacing_seconds)
+                self._sleep_with_deadline(wait, budget)
+            except Exception as exc:
+                last_error = SourceError(ErrorKind.TEMPORARY, "树洞回复请求异常")
+                if self._budget_expired(budget) or attempt == 1:
+                    raise last_error from exc
+                wait = max(self.settings.retry_wait_seconds, self.settings.request_spacing_seconds)
+                self._sleep_with_deadline(wait, budget)
+        raise last_error or SourceError(ErrorKind.TEMPORARY, "树洞回复请求失败")
 
     def _record_fetch(self, fetch: FetchSummary, now: datetime) -> None:
         values: dict[str, str | None] = {"last_poll_finished_at": _iso(now)}
@@ -684,7 +836,7 @@ class Runner:
             return replace(summary, elapsed_seconds=self._elapsed(started_mono))
         if self._budget_expired(budget):
             batch_state = (
-                self.store.latest_outbox_status(summary.batch_id)
+                self.store.notification_group_status(summary.batch_id)
                 if summary.batch_id
                 else summary.batch_state
             )
@@ -706,7 +858,6 @@ class Runner:
                 budget,
                 preferred_batch_id=preferred_batch_id,
             )
-            preferred_batch_id = None
             if outcome.batch_id is None:
                 send_error_kind = send_error_kind or outcome.error_kind
                 send_error_message = send_error_message or outcome.error_message
@@ -729,7 +880,7 @@ class Runner:
                 self.clock.sleep(spacing)
 
         batch_state = (
-            self.store.latest_outbox_status(summary.batch_id)
+            self.store.notification_group_status(summary.batch_id)
             if summary.batch_id
             else summary.batch_state
         )
@@ -783,17 +934,21 @@ class Runner:
                     error_message="今日通知尝试预算已用尽",
                 )
             return _SendOutcome()
-        from .models import Digest
-
+        row = self.store.outbox(claim.batch_id)
+        if row is None:
+            raise StoreError("已认领通知批次不存在")
         digest = Digest(
             batch_id=claim.batch_id,
+            group_id=str(row["group_id"]),
+            part_index=int(row["part_index"]),
+            part_count=int(row["part_count"]),
             title=claim.title,
             content=claim.content,
             post_ids=tuple(str(row["id"]) for row in self.store.posts_for_batch(claim.batch_id)),
             created_at=claim.created_at,
             coverage=Coverage(self.store.get_state("coverage", Coverage.BOUNDED.value)),
-            post_count=self.store.outbox(claim.batch_id)["post_count"],
-            shown_count=self.store.outbox(claim.batch_id)["shown_count"],
+            post_count=int(row["post_count"]),
+            shown_count=int(row["shown_count"]),
         )
         if self._budget_expired(budget):
             result = SendResult(

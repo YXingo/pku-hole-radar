@@ -55,6 +55,7 @@ def test_config_resolves_paths_relative_to_config_file(tmp_path: Path) -> None:
     assert config.poll.page_size == 30
     assert config.notify.provider == "stdout"
     assert config.notify.send_spacing_seconds == 13
+    assert config.notify.push_when_post_count_exceeds == 0
     assert config.attention.enabled is False
 
 
@@ -92,6 +93,17 @@ def test_zero_request_limit_is_allowed(tmp_path: Path) -> None:
     config = load_config(config_path)
 
     assert config.poll.max_requests == 0
+
+
+def test_notification_post_threshold_is_configurable(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path / "config.toml")
+    content = config_path.read_text(encoding="utf-8").replace(
+        "max_message_chars = 6000",
+        "max_message_chars = 6000\npush_when_post_count_exceeds = 100",
+    )
+    config_path.write_text(content, encoding="utf-8")
+
+    assert load_config(config_path).notify.push_when_post_count_exceeds == 100
 
 
 def test_environment_value_wins_without_overwriting(tmp_path: Path) -> None:

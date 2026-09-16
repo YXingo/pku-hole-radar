@@ -19,6 +19,7 @@ Chrome 中的合法登录会话观察到真实列表请求和成功响应，并�
 | [PKUHoleTUI](https://github.com/dfshfghj/PKUHoleTUI/tree/8ac64808c97ab87bbcc5ed70e28932cdf3989120) | commit `8ac64808c97ab87bbcc5ed70e28932cdf3989120`，2026-08-23 | 公开代码确认；线索而非官方承诺 | MIT 许可客户端将最新列表实现为 `GET /chapi/api/v3/hole/list_comments`，请求 `page`、`limit`、`comment_limit`、`comment_stream`，并解析 `data.list` / `data.total`。 |
 | 无会话最小请求 | 2026-09-05 | 账号实测（未登录负例） | 对下述列表地址请求 `page=1&limit=1&comment_limit=0&comment_stream=1` 返回 HTTP 401、`WWW-Authenticate: jwt-auth` 和 HTML `Unauthorized` 页面；未取得成功列表，不能据此确认登录后的字段值。 |
 | Chrome 登录会话的官网 Network 面板 | 2026-09-05/06 | 账号实测（浏览器） | 首页实际发出 `GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments?page=1&limit=10&comment_limit=10&comment_stream=1`，随后观察到 page 2、page 3；三次均为 HTTP 200，响应可在 Preview 中解析。 |
+| 本机会话的回复结构 probe | 2026-09-15 | 账号实测（只读） | 列表元素包含 `comment_total` / `comment_list`，但当前会话即使设置 `comment_limit=10` 也未稳定返回内嵌回复。独立 `GET /chapi/api/v3/comment/list` 返回 `data.list` / `data.total`；使用 `comment_stream=0` 时 `total` 与实际回复数一致，`comment_stream=1` 时实测 `total` 退化为请求的 `limit`，因此完整回复分页固定使用 `0`。probe 只输出字段名、类型和数量，未输出正文、PID 或凭据。 |
 
 ### 1.2 账号实测的列表响应
 
@@ -74,6 +75,7 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 - 可选查询字段在客户端中还包括 `pid`、`keyword`、`label`、`kind`、`is_follow`；PKUHoleRadar 首版不使用这些服务端筛选字段，关键词在本地完成。
 - 成功 JSON 至少应有顶层 `code=20000`，`data.list` 数组和 `data.total` 数字。列表元素公开代码读取的业务字段包括：`pid`、`text`、`timestamp`、`is_top`、`media_ids`，以及若干状态字段。
 - `pid` 是十进制整数形态，`timestamp` 的本次账号实测样本符合 Unix 秒（`int32`）；仍不把时区显示或服务端长期稳定性写成平台保证。
+- 关注帖回复使用 `GET /chapi/api/v3/comment/list?pid=<pid>&page=<page>&limit=50&sort=0&comment_stream=0`。响应回复字段至少包括 `cid`、`pid`、`text`、`timestamp`、`is_author`、`is_lz`、`media_ids` 和 `quote`；程序按页校验总数及 CID 去重，分页期间数量不一致时延后通知，而不发送自称完整的残缺内容。
 - `is_top=1` 被客户端显示为“置顶”。本项目会把置顶帖从水位边界判断中排除。
 
 证据链接：
@@ -82,6 +84,8 @@ GET https://treehole.pku.edu.cn/chapi/api/v3/hole/list_comments
 - [PKUHoleTUI `treehole.go`（commit 固定链接）](https://github.com/dfshfghj/PKUHoleTUI/blob/8ac64808c97ab87bbcc5ed70e28932cdf3989120/internal/client/treehole.go#L516-L530)：列表方法、页码和参数。
 - [PKUHoleTUI `treehole_v3.go`（commit 固定链接）](https://github.com/dfshfghj/PKUHoleTUI/blob/8ac64808c97ab87bbcc5ed70e28932cdf3989120/internal/client/treehole_v3.go#L248-L300)：V3 列表 envelope 和 `list` / `total` 映射。
 - [PKUHoleTUI `treehole_v3.go`（commit 固定链接）](https://github.com/dfshfghj/PKUHoleTUI/blob/8ac64808c97ab87bbcc5ed70e28932cdf3989120/internal/client/treehole_v3.go#L813-L855)：帖子字段映射。
+- [PKUHoleTUI `treehole_v3.go`（commit 固定链接）](https://github.com/dfshfghj/PKUHoleTUI/blob/8ac64808c97ab87bbcc5ed70e28932cdf3989120/internal/client/treehole_v3.go#L467-L490)：独立回复接口的 `pid`、页码、排序和 `comment_stream` 参数，以及 `list` / `total` 映射。
+- [PKUHoleTUI `treehole_v3.go`（commit 固定链接）](https://github.com/dfshfghj/PKUHoleTUI/blob/8ac64808c97ab87bbcc5ed70e28932cdf3989120/internal/client/treehole_v3.go#L895-L955)：回复正文、时间、洞主标记和引用关系字段。
 
 ### 1.4 会话字段
 

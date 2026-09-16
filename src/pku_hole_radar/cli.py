@@ -177,9 +177,10 @@ def _preview(config, secrets: dict[str, str], args: argparse.Namespace) -> int:
                     send=False,
                 )
                 summary = runner.run_once()
-                if runner.last_digest is not None:
-                    print(runner.last_digest.title)
-                    print(runner.last_digest.content)
+                if runner.last_digests:
+                    for digest in runner.last_digests:
+                        print(digest.title)
+                        print(digest.content)
                 elif runner.last_fetch and runner.last_fetch.baseline:
                     print("当前尚未建立生产基线；live preview 不会建立基线，因此本次不生成通知。")
                 _print_summary(summary)
@@ -323,6 +324,7 @@ def _status(config) -> int:
         now = datetime.now(UTC)
         day_start, day_end = _day_bounds(now, config.app.timezone)
         attempts = store.send_attempt_count(day_start, day_end)
+        accumulated = store.pending_notification_count()
     print(f"基线：{'已建立' if values.get('baseline_initialized') == '1' else '未建立'}")
     print(f"水位：{values.get('watermark_id') or '无上界/未建立'}")
     print(f"覆盖：{values.get('coverage') or '未知'}")
@@ -336,6 +338,11 @@ def _status(config) -> int:
     if values.get("pause_reason"):
         print(f"暂停原因：{values['pause_reason']}")
     print(f"outbox：{', '.join(f'{key}={value}' for key, value in sorted(counts.items())) or '空'}")
+    attention_trigger = "，或命中关注主题" if config.attention.enabled else ""
+    print(
+        f"累计待通知帖子：{accumulated}（数量严格超过 "
+        f"{config.notify.push_when_post_count_exceeds} 条{attention_trigger}时触发）"
+    )
     print(f"今日发送尝试：{attempts}/{config.notify.max_send_attempts_per_day}")
     if attention_rows:
         print("需关注批次（完整详情请执行 outbox list）：")
@@ -537,6 +544,7 @@ def _runner_settings(config, *, fixture: bool = False) -> RunnerSettings:
         run_timeout_seconds=config.poll.run_timeout_seconds,
         daily_send_limit=config.notify.max_send_attempts_per_day,
         pending_ttl_hours=config.notify.pending_ttl_hours,
+        push_when_post_count_exceeds=config.notify.push_when_post_count_exceeds,
         send_spacing_seconds=config.notify.send_spacing_seconds,
         send_retry_spacing_seconds=config.notify.send_retry_spacing_seconds,
         cleanup_interval_seconds=86400,
@@ -586,6 +594,7 @@ def _print_summary(summary) -> None:
 def _format_outbox_row(row) -> str:
     return (
         f"批次 {row['batch_id']}：状态={row['status']}，尝试={row['attempts']}，"
+        f"分片={row['part_index']}/{row['part_count']}，"
         f"下次发送={row['next_attempt_at'] or '无'}，"
         f"错误类型={row['last_error_kind'] or '无'}，"
         f"错误说明={row['last_error_message'] or '无'}，"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +55,48 @@ def make_batch(
     )
 
 
+def test_schema_v1_migration_does_not_requeue_historical_posts(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE outbox (
+            batch_id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT,
+            post_count INTEGER NOT NULL, shown_count INTEGER NOT NULL, status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+            provider_receipt TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            last_error_kind TEXT
+        );
+        CREATE TABLE posts (
+            id TEXT PRIMARY KEY, created_at TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+            snippet TEXT NOT NULL, url TEXT NOT NULL, matched INTEGER NOT NULL,
+            batch_id TEXT REFERENCES outbox(batch_id)
+        );
+        CREATE TABLE send_attempts (
+            attempt_id TEXT PRIMARY KEY, batch_id TEXT REFERENCES outbox(batch_id),
+            started_at TEXT NOT NULL, finished_at TEXT, result TEXT NOT NULL,
+            provider_receipt TEXT, error_kind TEXT, error_message TEXT
+        );
+        INSERT INTO posts VALUES (
+            '101', '2026-09-05T00:00:00+00:00', '2026-09-05T00:00:00+00:00',
+            '旧片段', 'https://fixture.test/post/101', 1, NULL
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.close()
+
+    with Store(database) as store:
+        assert store.schema_version() == 2
+        assert store.pending_notification_count() == 0
+        row = store.connection.execute(
+            "SELECT body, has_media, notify_pending FROM posts WHERE id = '101'"
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("旧片段", 0, 0)
+
+
 def test_claim_outbox_prefers_current_batch_before_older_backlog() -> None:
     store = Store(":memory:")
     try:
@@ -91,6 +135,77 @@ def test_claim_outbox_prefers_current_batch_before_older_backlog() -> None:
         ).claim
         assert backlog is not None
         assert backlog.batch_id == "batch-old"
+    finally:
+        store.close()
+
+
+def test_current_multipart_group_stays_ahead_of_older_backlog() -> None:
+    store = Store(":memory:")
+    try:
+        make_batch(store, created_at=NOW, post_id="101", batch_id="batch-old")
+        current_time = NOW + timedelta(minutes=10)
+        current_post = post("102")
+        first_part = Digest(
+            batch_id="group-current-0001",
+            group_id="group-current",
+            part_index=1,
+            part_count=2,
+            title="关注提醒（1/2）",
+            content="第一部分",
+            post_ids=("102",),
+            created_at=current_time,
+            coverage=Coverage.BOUNDED,
+            post_count=1,
+            shown_count=1,
+        )
+        second_part = Digest(
+            batch_id="group-current-0002",
+            group_id="group-current",
+            part_index=2,
+            part_count=2,
+            title="关注提醒（2/2）",
+            content="第二部分",
+            post_ids=(),
+            created_at=current_time,
+            coverage=Coverage.BOUNDED,
+            post_count=1,
+            shown_count=0,
+        )
+        store.commit_collection(
+            now=current_time,
+            posts=[current_post],
+            matched_ids={current_post.id},
+            digests=(first_part, second_part),
+            coverage=Coverage.BOUNDED,
+            proposed_watermark="102",
+        )
+        day_start, day_end = day_bounds()
+
+        first = store.claim_outbox(
+            now=current_time,
+            daily_limit=60,
+            day_start=day_start,
+            day_end=day_end,
+            pending_ttl=timedelta(hours=24),
+            preferred_batch_id=first_part.batch_id,
+        ).claim
+        assert first is not None and first.batch_id == first_part.batch_id
+        store.finish_send(
+            first.attempt_id,
+            current_time,
+            SendResult(SendState.ACCEPTED, provider_receipt="part-1"),
+        )
+        assert store.notification_group_status(first_part.batch_id) == SendState.PENDING
+
+        second = store.claim_outbox(
+            now=current_time,
+            daily_limit=60,
+            day_start=day_start,
+            day_end=day_end,
+            pending_ttl=timedelta(hours=24),
+            preferred_batch_id=first_part.batch_id,
+        ).claim
+        assert second is not None and second.batch_id == second_part.batch_id
     finally:
         store.close()
 
