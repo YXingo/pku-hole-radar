@@ -206,6 +206,7 @@ def load_config(path: str | Path) -> AppConfig:
     attention_raw = _table(raw, "attention")
     unknown_attention = set(attention_raw) - {
         "enabled",
+        "career_enabled",
         "title_max_chars",
         "max_title_categories",
         "preferred_locations",
@@ -231,6 +232,7 @@ def load_config(path: str | Path) -> AppConfig:
     try:
         attention = AttentionSettings(
             enabled=_bool(attention_raw, "enabled", False),
+            career_enabled=_bool(attention_raw, "career_enabled", False),
             title_max_chars=_positive_int(attention_raw, "title_max_chars", 40),
             max_title_categories=_positive_int(attention_raw, "max_title_categories", 2),
             preferred_locations=tuple(preferred_locations),

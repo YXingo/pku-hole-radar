@@ -29,9 +29,11 @@ timestamp_unit = "seconds"
 include_any = []
 exclude_any = []
 
-# 关注摘要默认关闭；开启后只改变通知标题、详情排序和本地摘录，不改变采集范围。
+# 关注摘要默认关闭；命中后触发推送并优先展示完整详情，不改变采集范围。
 [attention]
 enabled = false
+# 独立职业规则：行业/岗位（含央国企、公务员、事业单位）+ 职业议题，或明确求职择业表达。
+career_enabled = false
 title_max_chars = 40
 max_title_categories = 2
 # 公开示例不预设个人地点偏好；可填 "深圳"、"远程"，顺序即优先级。

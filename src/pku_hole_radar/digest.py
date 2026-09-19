@@ -191,6 +191,10 @@ def _render_full_attention_post(
         lines.append("｜".join(details))
     if match.matched_keywords:
         lines.append("命中词：" + "、".join(match.matched_keywords))
+    if match.topics:
+        lines.append("关注主题：" + "、".join(match.topics))
+    if match.reason:
+        lines.append("纳入理由：" + match.reason)
     lines.extend(
         (
             "原帖全文：",
@@ -391,6 +395,7 @@ def _attention_title(
     labels = {
         AttentionCategory.INTERNSHIP: "实习",
         AttentionCategory.RESEARCH: "科研",
+        AttentionCategory.CAREER: "职业",
         AttentionCategory.EXCHANGE: "交流",
     }
     if not categories:
@@ -463,6 +468,10 @@ def _render_attention(
                 if match.matched_keywords:
                     keywords = "、".join(match.matched_keywords[:4])
                     line += f"\n命中词：{keywords}"
+                if match.topics:
+                    line += "\n关注主题：" + "、".join(match.topics)
+                if match.reason:
+                    line += "\n纳入理由：" + match.reason
             else:
                 snippet = compact_text(
                     post.text,
@@ -493,6 +502,7 @@ def _attention_overview(
         "\n关注概览（关键词规则）："
         f"实习线索 {counts[AttentionCategory.INTERNSHIP]}，"
         f"科研线索 {counts[AttentionCategory.RESEARCH]}，"
+        f"职业发展 {counts[AttentionCategory.CAREER]}，"
         f"相关交流 {counts[AttentionCategory.EXCHANGE]}，"
         f"其他 {other_count}"
     )

@@ -57,6 +57,7 @@ def test_config_resolves_paths_relative_to_config_file(tmp_path: Path) -> None:
     assert config.notify.send_spacing_seconds == 13
     assert config.notify.push_when_post_count_exceeds == 0
     assert config.attention.enabled is False
+    assert config.attention.career_enabled is False
 
 
 def test_blank_keyword_is_rejected(tmp_path: Path) -> None:

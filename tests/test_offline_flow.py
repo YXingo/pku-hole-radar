@@ -343,6 +343,50 @@ def test_attention_bypasses_threshold_and_includes_complete_comments() -> None:
         store.close()
 
 
+@pytest.mark.parametrize("career_enabled", [False, True])
+@pytest.mark.parametrize(
+    "text", ["国企算法岗薪资和工作强度如何？", "公务员和事业单位待遇怎么比较？"]
+)
+def test_career_attention_controls_single_post_trigger_and_full_reply(
+    career_enabled: bool, text: str
+) -> None:
+    with Store(":memory:") as store:
+        seed_watermark(store)
+        focused = make_post(101, text)
+        source = SequenceSource(
+            [Page([focused], exhausted=True)],
+            comments_by_post={"101": (make_comment(1, 101, "这是完整的合成回复。"),)},
+        )
+        notifier = RecordingNotifier()
+        summary = run(
+            store,
+            source,
+            FakeClock(datetime(2026, 9, 5, tzinfo=UTC)),
+            notifier=notifier,
+            push_when_post_count_exceeds=100,
+            request_spacing_seconds=0,
+            digest_options=DigestOptions(
+                timezone=ZoneInfo("Asia/Shanghai"),
+                attention=AttentionSettings(enabled=True, career_enabled=career_enabled),
+                allowed_hosts=frozenset({"fixture.test"}),
+            ),
+        )
+        if career_enabled:
+            assert summary.batch_state == SendState.ACCEPTED
+            assert len(notifier.digests) == 1
+            digest = notifier.digests[0]
+            assert digest.title.startswith("职业1")
+            assert focused.text in digest.content
+            assert "这是完整的合成回复。" in digest.content
+            assert "纳入理由" in digest.content
+            assert store.pending_notification_count() == 0
+        else:
+            assert summary.batch_id is None
+            assert notifier.digests == []
+            assert source.comment_calls == []
+            assert store.pending_notification_count() == 1
+
+
 def test_links_only_attention_does_not_fetch_or_expose_comments() -> None:
     store = Store(":memory:")
     try:
